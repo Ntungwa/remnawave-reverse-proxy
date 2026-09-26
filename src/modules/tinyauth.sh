@@ -76,12 +76,38 @@ tinyauth_compose_service() {
 EOL
 }
 
+# Emits the TinyAuth + panel nginx server blocks for the given listener.
+#
+# Listener semantics:
+#   "unix:/dev/shm/nginx.sock proxy_protocol"  → Xray owns 443, nginx is
+#     cleartext on the socket. No ssl_* directives; the real client IP comes
+#     from the proxy_protocol header.
+#   "443 ssl"                                  → no Xray on this box, nginx
+#     terminates TLS itself. Certificates are emitted as before.
+#
+# Mode is inferred from the listener string. Cert arguments are only used in
+# TLS mode; callers that pass them in cleartext mode lose nothing.
 tinyauth_nginx_sites() {
     local listener="$1"
     local panel_domain="$2"
     local panel_cert="$3"
     local tinyauth_cert="$4"
     local backend="$5"
+
+    local tls_mode=0
+    case "$listener" in
+        *ssl*) tls_mode=1 ;;
+    esac
+
+    # Real client IP source depends on the mode: Xray forwards it via the
+    # PROXY v2 header on the cleartext socket, the TCP socket carries it
+    # directly on TLS.
+    local real_ip
+    if [ "$tls_mode" = "1" ]; then
+        real_ip='$remote_addr'
+    else
+        real_ip='$proxy_protocol_addr'
+    fi
 
     cat <<EOL
 
@@ -94,20 +120,28 @@ server {
     server_name $TINYAUTH_DOMAIN;
     listen $listener;
     http2 on;
+EOL
 
-    ssl_certificate "/etc/nginx/ssl/$tinyauth_cert/fullchain.pem";
-    ssl_certificate_key "/etc/nginx/ssl/$tinyauth_cert/privkey.pem";
-    ssl_trusted_certificate "/etc/nginx/ssl/$tinyauth_cert/fullchain.pem";
+    if [ "$tls_mode" = "1" ]; then
+        cat <<EOL
+
+    ssl_certificate "/etc/letsencrypt/live/$tinyauth_cert/fullchain.pem";
+    ssl_certificate_key "/etc/letsencrypt/live/$tinyauth_cert/privkey.pem";
+    ssl_trusted_certificate "/etc/letsencrypt/live/$tinyauth_cert/fullchain.pem";
+EOL
+    fi
+
+    cat <<EOL
 
     location / {
         proxy_http_version 1.1;
         proxy_pass http://tinyauth;
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP $real_ip;
+        proxy_set_header X-Forwarded-For $real_ip;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Port \$server_port;
+        proxy_set_header X-Forwarded-Port 443;
         proxy_send_timeout 60s;
         proxy_read_timeout 60s;
     }
@@ -118,10 +152,18 @@ server {
     listen $listener;
     http2 on;
     gzip on;
+EOL
 
-    ssl_certificate "/etc/nginx/ssl/$panel_cert/fullchain.pem";
-    ssl_certificate_key "/etc/nginx/ssl/$panel_cert/privkey.pem";
-    ssl_trusted_certificate "/etc/nginx/ssl/$panel_cert/fullchain.pem";
+    if [ "$tls_mode" = "1" ]; then
+        cat <<EOL
+
+    ssl_certificate "/etc/letsencrypt/live/$panel_cert/fullchain.pem";
+    ssl_certificate_key "/etc/letsencrypt/live/$panel_cert/privkey.pem";
+    ssl_trusted_certificate "/etc/letsencrypt/live/$panel_cert/fullchain.pem";
+EOL
+    fi
+
+    cat <<EOL
 
     # Everything sits behind TinyAuth: browsers log in through the portal,
     # API clients send their TinyAuth credentials in X-Api-Key while the
@@ -132,7 +174,7 @@ server {
         proxy_pass http://tinyauth/api/auth/nginx;
         proxy_pass_request_body off;
         proxy_set_header Content-Length "";
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host \$host;
         proxy_set_header X-Forwarded-Uri \$request_uri;
 
@@ -152,11 +194,11 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \$connection_upgrade;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP $real_ip;
+        proxy_set_header X-Forwarded-For $real_ip;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Port \$server_port;
+        proxy_set_header X-Forwarded-Port 443;
 
         # Preserve credentials intended for the protected application, strip
         # the TinyAuth ones.

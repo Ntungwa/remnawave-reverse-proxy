@@ -1,5 +1,18 @@
 #!/bin/bash
 # Module: Certificates — certbot issuance, renewal, hooks and cron
+#
+# Design A: Xray owns 443 and reads the certificates out of
+# /etc/letsencrypt on each node. nginx / caddy behind it are cleartext and
+# hold no cert at all. This module no longer touches the compose file — the
+# installers mount the whole /etc/letsencrypt tree into remnanode inline,
+# and no /etc/nginx/ssl/... path exists anywhere any more.
+#
+# The only per-container fact this module cares about is: which containers
+# read certs and must therefore be restarted when a renewal lands. That is
+# `remnanode` (Xray, on every box where Xray runs) plus, on panel-only and
+# sub-only boxes, whichever webserver terminates TLS there. The deploy hook
+# restarts all three names and relies on `2>/dev/null || true` to swallow
+# the ones that are not running on this box.
 
 # The real certbot lineage covering a domain: wildcard methods name it after
 # the base zone, renewals may append -0001 suffixes, and the caller only
@@ -147,7 +160,12 @@ EOL
                 --elliptic-curve secp384r1
             ;;
         4)
-            # ACME HTTP-01 (without wildcard)
+            # ACME HTTP-01 (without wildcard). Under Design A nothing on this
+            # box holds :80 — Xray owns 443 and the webserver sits on a unix
+            # socket — so the standalone challenge has the port to itself.
+            # The stop/start of nginx/caddy that the old flow needed is left
+            # in place: it is a no-op when the container is not running and
+            # keeps older non-Design-A layouts working.
             local nginx_was_running=false
             if docker ps --filter "name=^/remnawave-nginx$" --format '{{.Names}}' | grep -qx "remnawave-nginx"; then
                 nginx_was_running=true
@@ -183,13 +201,13 @@ EOL
 
             if ! certbot plugins 2>/dev/null | grep -q "dns-gcore"; then
                 echo -e "${COLOR_YELLOW}${LANG[GCORE_PLUGIN_INSTALLING]}${COLOR_RESET}"
-                
+
                 if python3 -m pip install --help 2>&1 | grep -q "break-system-packages"; then
                     python3 -m pip install --break-system-packages certbot-dns-gcore >/dev/null 2>&1
                 else
                 python3 -m pip install certbot-dns-gcore >/dev/null 2>&1
                 fi
-                    
+
                 if certbot plugins 2>/dev/null | grep -q "dns-gcore"; then
                     echo -e "${COLOR_GREEN}${LANG[GCORE_PLUGIN_INSTALLED]}${COLOR_RESET}"
                 else
@@ -671,6 +689,12 @@ check_cert_expiry() {
     return 0
 }
 
+# Renewal hooks for a certificate. Under Design A the cert reader is
+# remnanode (Xray), which does not hot-reload through its bind mounts, so it
+# must be restarted on every renewal. On panel-only and sub-only boxes the
+# webserver holds the cert instead; restarting it is included for the same
+# reason. All three container names go into the hook, and the
+# `2>/dev/null || true` swallows the ones that do not run on this box.
 configure_certbot_renewal_hooks() {
     local renewal_conf="$1"
 
@@ -681,10 +705,13 @@ configure_certbot_renewal_hooks() {
     sed -i -E '/^(pre_hook|post_hook|renew_hook|deploy_hook) = /d' "$renewal_conf"
 
     if grep -Eq '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*standalone[[:space:]]*$' "$renewal_conf"; then
+        # ACME HTTP-01: the standalone challenge needs :80 free. Under
+        # Design A nothing on this box holds :80, so the stop/start is a
+        # no-op on those layouts and stays for older non-Design-A setups.
         echo "pre_hook = /usr/bin/docker stop remnawave-nginx" >> "$renewal_conf"
-        echo "post_hook = /usr/bin/docker start remnawave-nginx" >> "$renewal_conf"
+        echo "post_hook = /usr/bin/docker start remnawave-nginx remnanode" >> "$renewal_conf"
     else
-        echo "deploy_hook = /usr/bin/docker restart remnawave-nginx" >> "$renewal_conf"
+        echo "deploy_hook = /usr/bin/docker restart remnanode remnawave-nginx remnawave-caddy 2>/dev/null || true" >> "$renewal_conf"
     fi
 }
 
@@ -762,9 +789,13 @@ handle_certificates() {
     local -n domains_to_check_ref=$1
     local cert_method="$2"
     local letsencrypt_email="$3"
+    # target_dir is kept in the signature for call-site compatibility — the
+    # installers still pass it — but it is no longer used here: this module
+    # stopped editing docker-compose.yml when Design A moved the cert mounts
+    # (single /etc/letsencrypt tree) into the installer heredocs.
     local target_dir="${4:-/opt/remnawave}"
+    : "$target_dir"
 
-    declare -A unique_domains
     local need_certificates=false
     local min_days_left=9999
 
@@ -894,8 +925,6 @@ handle_certificates() {
         done
     fi
 
-    declare -A cert_domains_added
-
     if [ "$need_certificates" = true ] && [ "$cert_method" = "5" ]; then
         # Own certificates: the user uploads each missing domain; a
         # single wildcard upload covers the rest of the domains
@@ -903,8 +932,8 @@ handle_certificates() {
             if check_certificates "$domain" > /dev/null 2>&1; then
                 continue
             fi
-            # Fresh install: mounts are added automatically below — the
-            # apply-manually notice would only confuse here
+            # Fresh install: the installer mounts the /etc/letsencrypt tree
+            # inline — the apply-manually notice would only confuse here
             manual_certificate_flow "$domain" quiet || return 1
         done
         setup_cert_telegram_notifications
@@ -915,7 +944,7 @@ handle_certificates() {
             # Skip what is already covered: for wildcard methods the first
             # subdomain of a zone issues the shared certificate and the rest
             # reuse it, so the per-domain loop replaces the old base-domain
-            # grouping; every domain then mounts the same lineage below.
+            # grouping.
             check_certificates "$domain" >/dev/null 2>&1 && continue
             get_certificates "$domain" "$cert_method" "$letsencrypt_email" || {
                 echo -e "${COLOR_RED}${LANG[CERT_GENERATION_FAILED]} $domain${COLOR_RESET}"
@@ -925,28 +954,16 @@ handle_certificates() {
         done
     fi
 
-    # Mounts follow the resolved lineage: one wildcard certificate is
-    # mounted once even when several domains live under it, and -0001
-    # suffixes from certbot renewals resolve to the real directory.
-    for domain in "${!domains_to_check_ref[@]}"; do
-        local cert_domain
-        if ! cert_domain=$(resolve_certificate_domain "$domain"); then
-            echo -e "${COLOR_RED}${LANG[CERT_GENERATION_FAILED]} $domain${COLOR_RESET}"
-            return 1
-        fi
-        if [ -z "${cert_domains_added[$cert_domain]}" ]; then
-            echo "      - /etc/letsencrypt/live/$cert_domain/fullchain.pem:/etc/nginx/ssl/$cert_domain/fullchain.pem:ro" >> "$target_dir/docker-compose.yml"
-            echo "      - /etc/letsencrypt/live/$cert_domain/privkey.pem:/etc/nginx/ssl/$cert_domain/privkey.pem:ro" >> "$target_dir/docker-compose.yml"
-            cert_domains_added["$cert_domain"]="1"
-        fi
-    done
+    # No compose edits. Design A mount layout is emitted by each installer
+    # inline: the whole /etc/letsencrypt tree goes into whichever container
+    # reads the cert (remnanode when Xray runs, the webserver otherwise).
 
     local cron_command
-    # The deploy hook restarts the web server container only when a cert
-    # was actually renewed: the certs are bind-mounted into the container
-    # by file, so without a restart it keeps serving the old inode until
-    # it eventually expires.
-    local renew_hook="docker restart remnawave-nginx remnawave-caddy 2>/dev/null || true"
+    # The deploy hook restarts the containers that actually read the certs:
+    # remnanode always (Xray holds them under Design A), and the webserver on
+    # boxes where it terminates TLS itself. Files are bind-mounted by file,
+    # so without a restart the container keeps serving the old inode.
+    local renew_hook="docker restart remnanode remnawave-nginx remnawave-caddy 2>/dev/null || true"
     if [ "$cert_method" == "4" ]; then
         cron_command="ufw allow 80/tcp >/dev/null 2>&1 && /usr/bin/certbot renew --quiet --deploy-hook \"$renew_hook\"; certbot_status=\$?; ufw delete allow 80/tcp >/dev/null 2>&1; ufw reload >/dev/null 2>&1; exit \$certbot_status"
     else
@@ -1113,9 +1130,10 @@ manual_certificate_flow() {
 
             printf "${COLOR_GREEN}${LANG[CERT_MANUAL_OK]}${COLOR_RESET}\n" "$final_dir"
 
-            # The install flow wires certs into compose/web-server configs
-            # itself, but this menu cannot know which stack to patch — tell
-            # the user to apply the mounts manually if anything runs already.
+            # The install flow wires certs into the container that reads them
+            # itself (the whole /etc/letsencrypt tree is mounted inline under
+            # Design A), but this menu cannot know which stack to patch — tell
+            # the user to add the mount manually if anything runs already.
             if [ "$show_notice" != "quiet" ]; then
                 local final_name stack_hint="/opt/remnawave|/opt/remnanode|/opt/subscription"
                 final_name=$(basename "$final_dir")
