@@ -1,5 +1,15 @@
 #!/bin/bash
 # Module: Install Subscription Page Only (nginx)
+#
+# Standalone subscription page on its own box. No panel, no node, no Xray
+# on this server. nginx terminates TLS on 443 with certbot-issued certs.
+# The subscription page container runs on loopback and is proxied by nginx
+# behind whatever auth the operator chose.
+#
+# Design A note: this file is unchanged from the fork. The Design A shift
+# (Xray owns 443, webserver is a cleartext reverse proxy behind it) doesn't
+# apply because there is no Xray on this box. nginx already terminates TLS
+# on 443 here.
 
 install_sub_nginx() {
     mkdir -p /opt/subscription && cd /opt/subscription
@@ -97,6 +107,7 @@ services:
     network_mode: host
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
 EOL
 }
 
@@ -114,10 +125,14 @@ installation_sub() {
 
     handle_certificates domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" "/opt/subscription" || return 1
 
-    # The certificate directory is the lineage that actually covers the
-    # domain — a wildcard base or a -0001 renewal suffix, not a guess from
-    # the issuance method
     SUB_CERT_DOMAIN=$(resolve_certificate_domain "$SUB_DOMAIN") || return 1
+
+    # Certbot deploy hook restarts remnawave-nginx: the container reads its
+    # certs from the bind-mounted /etc/letsencrypt tree.
+    local renew_conf="/etc/letsencrypt/renewal/$SUB_CERT_DOMAIN.conf"
+    if [ -f "$renew_conf" ]; then
+        sed -i -E 's|^deploy_hook = .*|deploy_hook = /usr/bin/docker restart remnawave-nginx 2>/dev/null \|\| true|' "$renew_conf"
+    fi
 
     cat >> /opt/subscription/docker-compose.yml <<EOL
 
@@ -137,7 +152,6 @@ EOL
     cat > /opt/subscription/nginx.conf <<EOL
 server_names_hash_bucket_size 64;
 
-# Gzip Compression
 gzip_vary on;
 gzip_proxied any;
 gzip_comp_level 6;
@@ -180,9 +194,9 @@ server {
     http2 on;
     gzip on;
 
-    ssl_certificate "/etc/nginx/ssl/$SUB_CERT_DOMAIN/fullchain.pem";
-    ssl_certificate_key "/etc/nginx/ssl/$SUB_CERT_DOMAIN/privkey.pem";
-    ssl_trusted_certificate "/etc/nginx/ssl/$SUB_CERT_DOMAIN/fullchain.pem";
+    ssl_certificate "/etc/letsencrypt/live/$SUB_CERT_DOMAIN/fullchain.pem";
+    ssl_certificate_key "/etc/letsencrypt/live/$SUB_CERT_DOMAIN/privkey.pem";
+    ssl_trusted_certificate "/etc/letsencrypt/live/$SUB_CERT_DOMAIN/fullchain.pem";
 
     location / {
         proxy_http_version 1.1;

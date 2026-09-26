@@ -1,8 +1,14 @@
 #!/bin/bash
-# Module: Install Node Only
+# Module: Install Node Only (nginx, Xray TLS + static ECH on 443)
+#
+# Design A on a standalone node: Xray owns 443, terminates TLS for the
+# direct domain, falls back to a cleartext nginx on the shared unix socket.
+# nginx holds no certificate; the cert tree and the static ECH key mount
+# into remnanode. The whole compose and nginx.conf are written in one
+# heredoc each — conditional content is resolved by shell variables, never
+# patched with sed.
 
 install_node_nginx() {
-    # Load selfsteal templates module
     load_selfsteal_templates_module
 
     mkdir -p /opt/remnanode && cd /opt/remnanode
@@ -32,9 +38,7 @@ install_node_nginx() {
     CERTIFICATE=""
     while IFS= read -r line; do
         if [ -z "$line" ]; then
-            if [ -n "$CERTIFICATE" ]; then
-                break
-            fi
+            if [ -n "$CERTIFICATE" ]; then break; fi
         else
             CERTIFICATE="$CERTIFICATE$line\n"
         fi
@@ -43,11 +47,26 @@ install_node_nginx() {
     echo -e "${COLOR_YELLOW}${LANG[CERT_CONFIRM]}${COLOR_RESET}"
     read_yn confirm || { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
 
-SELFSTEAL_BASE_DOMAIN=$(extract_domain "$SELFSTEAL_DOMAIN")
+    SELFSTEAL_BASE_DOMAIN=$(extract_domain "$SELFSTEAL_DOMAIN")
+    unique_domains["$SELFSTEAL_BASE_DOMAIN"]=1
 
-unique_domains["$SELFSTEAL_BASE_DOMAIN"]=1
+    # ECH key: generate once, before the compose is written, so the
+    # remnanode volume list can carry (or omit) the mount at heredoc time.
+    if ! docker image inspect remnawave/node:latest >/dev/null 2>&1; then
+        step_do "${LANG[ECH_IMAGE_PULL]}"
+        docker pull remnawave/node:latest >/dev/null 2>&1 || true
+    fi
 
-cat > docker-compose.yml <<EOL
+    CP_ECH_KEY_PATH=""
+    CP_ECH_PUBLIC_CONFIG=""
+    ensure_ech_server_keys "/opt/remnanode" "$SELFSTEAL_DOMAIN" || true
+
+    local ech_mount_line=""
+    if [ -n "$CP_ECH_KEY_PATH" ]; then
+        ech_mount_line="      - ./ech:/etc/xray/ech:ro"
+    fi
+
+    cat > docker-compose.yml <<EOL
 x-common: &common
   ulimits:
     nofile:
@@ -63,6 +82,8 @@ x-logging: &logging
       max-file: 5
 
 services:
+  # Cleartext reverse proxy behind Xray. Listens on the shared unix socket
+  # with proxy_protocol. No certificate, no SSL directives.
   remnawave-nginx:
     image: nginx:1.30
     container_name: remnawave-nginx
@@ -71,6 +92,51 @@ services:
     network_mode: host
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /dev/shm:/dev/shm:rw
+      - /var/www/html:/var/www/html:ro
+    command: sh -c 'rm -f /dev/shm/nginx.sock && exec nginx -g "daemon off;"'
+
+  # Xray owns 443 (TLS). Certificates and the static ECH key mount here,
+  # never into nginx.
+  remnanode:
+    image: remnawave/node:latest
+    container_name: remnanode
+    hostname: remnanode
+    <<: [*common, *logging]
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - NODE_PORT=2222
+      - SECRET_KEY=$(echo -e "$CERTIFICATE")
+    volumes:
+      - /dev/shm:/dev/shm:rw
+      - /var/log/remnanode:/var/log/remnanode
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+$ech_mount_line
+EOL
+
+    # Cleartext server block on the socket: no ssl_certificate, no ssl_*
+    # tuning. Xray already terminated TLS; the camouflage site lives here.
+    cat > /opt/remnanode/nginx.conf <<EOL
+server_names_hash_bucket_size 64;
+
+server {
+    server_name $SELFSTEAL_DOMAIN;
+    listen unix:/dev/shm/nginx.sock proxy_protocol;
+    http2 on;
+
+    root /var/www/html;
+    index index.html;
+    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet, noimageindex" always;
+}
+
+server {
+    listen unix:/dev/shm/nginx.sock proxy_protocol default_server;
+    server_name _;
+    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet, noimageindex" always;
+    return 444;
+}
 EOL
 }
 
@@ -89,70 +155,14 @@ installation_node() {
 
     handle_certificates domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" "/opt/remnanode" || return 1
 
-    # The certificate directory is the lineage that actually covers the
-    # domain — a wildcard base or a -0001 renewal suffix, not a guess from
-    # the issuance method
     NODE_CERT_DOMAIN=$(resolve_certificate_domain "$SELFSTEAL_DOMAIN") || return 1
 
-    cat >> /opt/remnanode/docker-compose.yml <<EOL
-      - /dev/shm:/dev/shm:rw
-      - /var/www/html:/var/www/html:ro
-    command: sh -c 'rm -f /dev/shm/nginx.sock && exec nginx -g "daemon off;"'
-
-  remnanode:
-    image: remnawave/node:latest
-    container_name: remnanode
-    hostname: remnanode
-    <<: [*common, *logging]
-    network_mode: host
-    cap_add:
-      - NET_ADMIN
-    environment:
-      - NODE_PORT=2222
-      - SECRET_KEY=$(echo -e "$CERTIFICATE")
-    volumes:
-      - /dev/shm:/dev/shm:rw
-      - /var/log/remnanode:/var/log/remnanode
-EOL
-
-cat > /opt/remnanode/nginx.conf <<EOL
-server_names_hash_bucket_size 64;
-
-map \$http_upgrade \$connection_upgrade {
-    default upgrade;
-    ""      close;
-}
-
-ssl_protocols TLSv1.2 TLSv1.3;
-ssl_ecdh_curve X25519:prime256v1:secp384r1;
-ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305';
-ssl_prefer_server_ciphers on;
-ssl_session_timeout 1d;
-ssl_session_cache shared:MozSSL:10m;
-ssl_session_tickets off;
-
-server {
-    server_name $SELFSTEAL_DOMAIN;
-    listen unix:/dev/shm/nginx.sock ssl proxy_protocol;
-    http2 on;
-
-    ssl_certificate "/etc/nginx/ssl/$NODE_CERT_DOMAIN/fullchain.pem";
-    ssl_certificate_key "/etc/nginx/ssl/$NODE_CERT_DOMAIN/privkey.pem";
-    ssl_trusted_certificate "/etc/nginx/ssl/$NODE_CERT_DOMAIN/fullchain.pem";
-
-    root /var/www/html;
-    index index.html;
-    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet, noimageindex" always;
-}
-
-server {
-    listen unix:/dev/shm/nginx.sock ssl proxy_protocol default_server;
-    server_name _;
-    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet, noimageindex" always;
-    ssl_reject_handshake on;
-    return 444;
-}
-EOL
+    # Certbot deploy hook restarts remnanode: Xray holds the certs and
+    # keeps serving the old inode through its bind mounts until restarted.
+    local renew_conf="/etc/letsencrypt/renewal/$NODE_CERT_DOMAIN.conf"
+    if [ -f "$renew_conf" ]; then
+        sed -i -E 's|^deploy_hook = .*|deploy_hook = /usr/bin/docker restart remnanode 2>/dev/null \|\| true|' "$renew_conf"
+    fi
 
     ufw allow from $PANEL_IP to any port 2222 > /dev/null 2>&1
     ufw reload > /dev/null 2>&1
@@ -187,4 +197,14 @@ EOL
         fi
         ((attempt++))
     done
+
+    if [ -n "$CP_ECH_PUBLIC_CONFIG" ]; then
+        echo -e ""
+        echo -e "${COLOR_GREEN}${LANG[ECH_PUBLISH_NOTICE]}${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}${LANG[ECH_PUBLIC_LABEL]}${COLOR_RESET}"
+        echo -e "${COLOR_WHITE}${CP_ECH_PUBLIC_CONFIG}${COLOR_RESET}"
+        echo -e ""
+        echo -e "${COLOR_YELLOW}${LANG[ECH_DNS_LABEL]}${COLOR_RESET}"
+        echo -e "${COLOR_WHITE}  _https.${SELFSTEAL_DOMAIN}  IN  HTTPS  1 .  ech=${CP_ECH_PUBLIC_CONFIG}${COLOR_RESET}"
+    fi
 }
