@@ -1,5 +1,18 @@
 #!/bin/bash
-# Module: Install Panel
+# Module: Install Panel Only (Caddy)
+#
+# No Xray on this box, so Caddy terminates TLS on 443 with its own
+# certificates. This is the one installer under Design A where Caddy holds
+# the certs. The direct domain is asked for anyway: it is the ECH
+# serverName that the panel will hand downstream to every node it manages,
+# and `xray tls ech` binds to it without needing the domain's cert here.
+#
+# Domain layout:
+#   default (bonded): 2 domains — CDN (panel + /sub) and Direct.
+#   optional split:   3 domains — panel, sub, direct.
+#
+# The whole compose is written in one heredoc — conditional content is
+# resolved by shell variables, never patched with sed.
 
 install_panel_caddy() {
     mkdir -p /opt/remnawave && cd /opt/remnawave
@@ -12,7 +25,14 @@ install_panel_caddy() {
         exit 1
     fi
 
-    if [ "$PANEL_WITH_SUB" != "false" ]; then
+    # Bonded is the default: the sub page lives on the CDN domain at /sub.
+    local split_sub="n"
+    printf ' %s' "$(question "${LANG[SUB_ON_PANEL_PATH_ASK]}")"
+    read_yn split_sub || true
+    echo
+
+    if [ "$split_sub" = "y" ]; then
+        SUB_ON_PANEL_PATH=false
         reading "${LANG[ENTER_SUB_DOMAIN]}" SUB_DOMAIN
         check_domain "$SUB_DOMAIN" true true
         local sub_check_result=$?
@@ -20,11 +40,31 @@ install_panel_caddy() {
             echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
             exit 1
         fi
+    else
+        SUB_ON_PANEL_PATH=true
+        SUB_DOMAIN="$PANEL_DOMAIN"
     fi
 
-    if [ "$PANEL_WITH_SUB" != "false" ] && [ "$PANEL_DOMAIN" = "$SUB_DOMAIN" ]; then
+    # The direct domain is asked here even though nothing on this box serves
+    # it: the ECH keypair binds to this hostname, and the operator will
+    # point remote nodes at the same name later.
+    reading "${LANG[ENTER_NODE_DOMAIN]}" SELFSTEAL_DOMAIN
+    if ! [[ "$SELFSTEAL_DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+        echo -e "${COLOR_RED}${LANG[CERT_MANUAL_BAD_DOMAIN]}${COLOR_RESET}"
+        exit 1
+    fi
+
+    if [ "$PANEL_DOMAIN" = "$SELFSTEAL_DOMAIN" ] || [ "$SUB_DOMAIN" = "$SELFSTEAL_DOMAIN" ]; then
         echo -e "${COLOR_RED}${LANG[DOMAINS_MUST_BE_UNIQUE]}${COLOR_RESET}"
         exit 1
+    fi
+
+    PANEL_BASE_DOMAIN=$(extract_domain "$PANEL_DOMAIN")
+
+    unique_domains["$PANEL_BASE_DOMAIN"]=1
+    if [ "$SUB_ON_PANEL_PATH" = false ]; then
+        SUB_BASE_DOMAIN=$(extract_domain "$SUB_DOMAIN")
+        unique_domains["$SUB_BASE_DOMAIN"]=1
     fi
 
     PANEL_AUTH_MODE=cookie
@@ -59,7 +99,6 @@ install_panel_caddy() {
     METRICS_PASS=$(generate_user)
 
     APP_SECRET=$(openssl rand -hex 64)
-    API_TOKEN=$(openssl rand -base64 48 | tr -dc 'a-zA-Z0-9' | head -c 64)
 
     if [ "$PANEL_AUTH_MODE" = "portal" ]; then
         AUTHP_ADMIN_USER="$SUPERADMIN_USERNAME"
@@ -69,47 +108,55 @@ install_panel_caddy() {
             "$AUTHP_ADMIN_USER" "$AUTHP_ADMIN_EMAIL" "$AUTHP_ADMIN_SECRET")
     fi
 
+    # SUB_PUBLIC_DOMAIN carries the /sub suffix when bonded. The sub-page
+    # container is given CUSTOM_SUB_PREFIX=/sub so it expects the same path.
+    local sub_public_domain sub_custom_prefix
+    if [ "$SUB_ON_PANEL_PATH" = true ]; then
+        sub_public_domain="${PANEL_DOMAIN}/sub"
+        sub_custom_prefix="/sub"
+    else
+        sub_public_domain="$SUB_DOMAIN"
+        sub_custom_prefix=""
+    fi
+
+    # ---- ECH key --------------------------------------------------------
+    # Generated before the compose is written. On panel-only there is no
+    # local Xray to serve it — the key is what the panel will inject into
+    # every XRAY_JSON subscription template for its remote nodes. Requires
+    # the node image on disk; pulled once here.
+    if ! docker image inspect remnawave/node:latest >/dev/null 2>&1; then
+        step_do "${LANG[ECH_IMAGE_PULL]}"
+        docker pull remnawave/node:latest >/dev/null 2>&1 || true
+    fi
+
+    CP_ECH_KEY_PATH=""
+    CP_ECH_PUBLIC_CONFIG=""
+    ensure_ech_server_keys "/opt/remnawave" "$SELFSTEAL_DOMAIN" || true
+
+    # ---- .env -----------------------------------------------------------
     cat > .env <<EOL
 ### APP ###
 APP_PORT=3000
 METRICS_PORT=3001
 
 ### API ###
-# Possible values: max (start instances on all cores), number (start instances on number of cores), -1 (start instances on all cores - 1)
-# !!! Do not set this value more than physical cores count in your machine !!!
-# Review documentation: https://remna.st/docs/install/environment-variables#scaling-api
 API_INSTANCES=1
 
 ### DATABASE ###
-# FORMAT: postgresql://{user}:{password}@{host}:{port}/{database}
 DATABASE_URL="postgresql://postgres:postgres@remnawave-db:5432/postgres"
 
 ### REDIS ###
 REDIS_SOCKET=/var/run/valkey/valkey.sock
-# Alternative to REDIS_SOCKET
-#REDIS_HOST=
-#REDIS_PORT=
 
 ### SECRETS ###
-### The single signing key of the panel: admin sessions, API tokens and the
-### password pepper. Replacing it locks every admin out of the panel.
 APP_SECRET=$APP_SECRET
 
-# Set the session idle timeout in the panel to avoid daily logins.
-# Value in hours: 12–168
 JWT_AUTH_LIFETIME=168
 
 ### TELEGRAM NOTIFICATIONS ###
 IS_TELEGRAM_NOTIFICATIONS_ENABLED=false
 TELEGRAM_BOT_TOKEN=change_me
-# is optional, only if you want to use proxy
-# FORMAT: protocol://user:password@host:port, example: socks5://proxy:1080
-# TELEGRAM_BOT_PROXY=change_me
 
-### TELEGRAM CHAT IDs in format: "chat_id:thread_id"
-# thread_id is optional, only if you want to use topics
-# example: "-100123:80" - -100123 is chat_id, 80 is thread_id
-# example: "-100123" - -100123 is chat_id, thread_id is not used
 TELEGRAM_NOTIFY_USERS=change_me
 TELEGRAM_NOTIFY_NODES=change_me
 TELEGRAM_NOTIFY_CRM=change_me
@@ -117,54 +164,38 @@ TELEGRAM_NOTIFY_SERVICE=change_me
 TELEGRAM_NOTIFY_TBLOCKER=change_me
 
 ### PANEL DOMAIN ###
-### Used to build panel links in Telegram notifications.
 PANEL_DOMAIN=$PANEL_DOMAIN
 
 ### FRONT_END ###
-# Used by CORS, you can leave it as * or place your domain there
 FRONT_END_DOMAIN=$PANEL_DOMAIN
 
 ### SUBSCRIPTION PUBLIC DOMAIN ###
-### DOMAIN, WITHOUT HTTP/HTTPS, DO NOT ADD / AT THE END ###
-### Used in "profile-web-page-url" response header and in UI/API ###
-### Review documentation: https://remna.st/docs/install/environment-variables#domains
-SUB_PUBLIC_DOMAIN=$SUB_DOMAIN
-
-### If CUSTOM_SUB_PREFIX is set in @remnawave/subscription-page, append the same path to SUB_PUBLIC_DOMAIN. Example: SUB_PUBLIC_DOMAIN=sub-page.example.com/sub ###
+SUB_PUBLIC_DOMAIN=$sub_public_domain
 
 ### PROMETHEUS ###
-### Metrics are available at http://127.0.0.1:METRICS_PORT/metrics
 METRICS_USER=$METRICS_USER
 METRICS_PASS=$METRICS_PASS
 
 ### Webhook configuration
-### Enable webhook notifications (true/false, defaults to false if not set or empty)
 WEBHOOK_ENABLED=false
-### Webhook URL to send notifications to (can specify multiple URLs separated by commas if needed)
-### Only http:// or https:// are allowed.
 WEBHOOK_URL=https://your-webhook-url.com/endpoint
-### This secret is used to sign the webhook payload, must be exact 64 characters. Only a-z, 0-9, A-Z are allowed.
 WEBHOOK_SECRET_HEADER=vsmu67Kmg6R8FjIOF1WUY8LWBHie4scdEqrfsKmyf4IAf8dY3nFS0wwYHkhh6ZvQ
 
 ### Bandwidth usage reached notifications
 BANDWIDTH_USAGE_NOTIFICATIONS_ENABLED=false
-# Only in ASC order (example: [60, 80]), must be valid array of integer(min: 25, max: 95) numbers. No more than 5 values.
 BANDWIDTH_USAGE_NOTIFICATIONS_THRESHOLD=[60, 80]
 
-### Not connected users notification (webhook, telegram)
+### Not connected users notification
 NOT_CONNECTED_USERS_NOTIFICATIONS_ENABLED=false
-# Only in ASC order (example: [6, 12, 24]), must be valid array of integer(min: 1, max: 168) numbers. No more than 3 values.
-# Each value represents HOURS passed after user creation (user.createdAt)
 NOT_CONNECTED_USERS_NOTIFICATIONS_AFTER_HOURS=[6, 24, 48]
 
 ### Database ###
-### For Postgres Docker container ###
-# NOT USED BY THE APP ITSELF
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
 POSTGRES_DB=postgres
 EOL
 
+    # ---- docker-compose.yml ---------------------------------------------
     cat > docker-compose.yml <<EOL
 x-common: &common
   ulimits:
@@ -253,6 +284,9 @@ services:
       timeout: 10s
       retries: 3
 
+  # No Xray on this box: Caddy owns 443 and terminates TLS itself with the
+  # panel and sub certificates. This is the one installer where Caddy holds
+  # the certs.
   remnawave-caddy:
       image: ${CADDY_IMAGE}
       container_name: remnawave-caddy
@@ -262,24 +296,30 @@ services:
       volumes:
           - ./Caddyfile:/etc/caddy/Caddyfile
           - /var/www/html:/var/www/html:ro
-          - /dev/shm:/dev/shm:rw
           - caddy_data:/data
-      command: sh -c 'rm -f /dev/shm/nginx.sock && caddy run --config /etc/caddy/Caddyfile --adapter caddyfile'
+      command: caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
       environment:
           - PANEL_DOMAIN=${PANEL_DOMAIN}
           - SUB_DOMAIN=${SUB_DOMAIN}
+          - SUB_ON_PANEL_PATH=${SUB_ON_PANEL_PATH}
           - BACKEND_URL=127.0.0.1:3000
           - SUB_BACKEND_URL=127.0.0.1:3010${AUTHP_ENV}
       healthcheck:
-          test: ["CMD", "test", "-S", "/dev/shm/nginx.sock"]
-          interval: 2s
+          test: ["CMD", "caddy", "version"]
+          interval: 10s
           timeout: 5s
-          retries: 15
+          retries: 6
           start_period: 5s
 EOL
 
-    if [ "$PANEL_WITH_SUB" != "false" ]; then
-        cat >> docker-compose.yml <<EOL
+    if [ "$SUB_ON_PANEL_PATH" = false ]; then
+        # Split subscription: separate container env, separate site later.
+        :
+    fi
+
+    # Caddy always serves the sub-page container on this box, whether the
+    # sub lives at /sub (bonded) or on its own hostname (split).
+    cat >> docker-compose.yml <<EOL
 
   remnawave-subscription-page:
     image: remnawave/subscription-page:latest
@@ -290,15 +330,12 @@ EOL
       - REMNAWAVE_PANEL_URL=http://remnawave:3000
       - APP_PORT=3010
       - REMNAWAVE_API_TOKEN=\$api_token
+      - CUSTOM_SUB_PREFIX=${sub_custom_prefix}
     ports:
       - '127.0.0.1:3010:3010'
     depends_on:
       remnawave:
         condition: service_healthy
-EOL
-    fi
-
-    cat >> docker-compose.yml <<EOL
 
 networks:
   remnawave-network:
@@ -321,10 +358,12 @@ volumes:
     external: false
 EOL
 
+    # ---- Caddyfile ------------------------------------------------------
+    # Caddy terminates TLS on 443 and serves its own ACME-managed certs from
+    # the caddy_data volume. Certs for the panel and (if split) sub domain
+    # come from certbot and mount into the container; the direct domain is
+    # NOT served here and its cert is not obtained on this box.
     if [ "$PANEL_AUTH_MODE" = "portal" ]; then
-        # Security block embedded verbatim from the official example
-        # (remnawave/caddy-with-auth: minimal-security-setup-with-mfa-
-        # with-api-without-auth); only the env var names are adapted.
         cat > /opt/remnawave/Caddyfile <<EOL
 {
     admin off
@@ -374,23 +413,23 @@ EOL
     }
 }
 
-http://{\$PANEL_DOMAIN} {
-    bind 0.0.0.0
-    redir https://{\$PANEL_DOMAIN}{uri} permanent
-}
-
 https://{\$PANEL_DOMAIN} {
     encode
 
-    # Open routes: the panel API carries its own Bearer-token auth, and
-    # OAuth2 callbacks must reach the backend untouched.
+    # Subscription: public by design, no portal auth.
+    route /sub/* {
+        reverse_proxy {\$SUB_BACKEND_URL} {
+            header_up X-Real-IP {remote}
+            header_up Host {host}
+        }
+    }
+
     route /api/* {
         reverse_proxy {\$BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
         }
     }
-
     route /oauth2/* {
         reverse_proxy {\$BACKEND_URL} {
             header_up Host {host}
@@ -402,11 +441,9 @@ https://{\$PANEL_DOMAIN} {
         request_header +X-Forwarded-Prefix /r
         authenticate with remnawaveportal
     }
-
     route /r* {
         authenticate with remnawaveportal
     }
-
     route /* {
         authorize with panelpolicy
         reverse_proxy {\$BACKEND_URL} {
@@ -417,23 +454,25 @@ https://{\$PANEL_DOMAIN} {
 }
 EOL
     else
-    cat > /opt/remnawave/Caddyfile <<EOL
+        cat > /opt/remnawave/Caddyfile <<EOL
 {
     admin off
-}
-
-http://{\$PANEL_DOMAIN} {
-    bind 0.0.0.0
-    redir https://{\$PANEL_DOMAIN}{uri} permanent
 }
 
 https://{\$PANEL_DOMAIN} {
     encode
 
+    # Subscription: public, no cookie required.
+    route /sub/* {
+        reverse_proxy {\$SUB_BACKEND_URL} {
+            header_up X-Real-IP {remote}
+            header_up Host {host}
+        }
+    }
+
     @has_token_param {
         query $cookies_random1=$cookies_random2
     }
-
     handle @has_token_param {
         header +Set-Cookie "$cookies_random1=$cookies_random2; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000"
     }
@@ -443,20 +482,14 @@ https://{\$PANEL_DOMAIN} {
         not header Cookie *$cookies_random1=$cookies_random2*
         not query $cookies_random1=$cookies_random2
     }
-
     handle @unauthorized {
         abort
     }
 
-    # OAuth2 callbacks land here from every provider's redirect without
-    # the access cookie. Referer can't tell them apart — Pocket ID is
-    # self-hosted and browsers may strip the header — but every real
-    # callback carries ?code and ?state, so only that knock gets through.
     @oauth2_callback {
         path /oauth2/*
         query code=* state=*
     }
-
     handle @oauth2_callback {
         reverse_proxy {\$BACKEND_URL} {
             header_up Host {host}
@@ -471,7 +504,7 @@ https://{\$PANEL_DOMAIN} {
 EOL
     fi
 
-    if [ "$PANEL_WITH_SUB" != "false" ]; then
+    if [ "$SUB_ON_PANEL_PATH" = false ]; then
         cat >> /opt/remnawave/Caddyfile <<EOL
 
 https://{\$SUB_DOMAIN} {
@@ -485,27 +518,46 @@ https://{\$SUB_DOMAIN} {
 }
 EOL
     fi
-
-    cat >> /opt/remnawave/Caddyfile <<EOL
-
-:80 {
-    bind 0.0.0.0
-    respond 204
-}
-EOL
 }
 
 installation_panel_caddy() {
     check_panel_not_running
     check_port_443_free
+    load_certificates_module
+    echo -e "${COLOR_YELLOW}${LANG[INSTALLING_PANEL]}${COLOR_RESET}"
+    sleep 1
+
+    declare -A unique_domains
     install_panel_caddy
-	
+
+    declare -A domains_to_check
+    domains_to_check["$PANEL_DOMAIN"]=1
+    if [ "$SUB_ON_PANEL_PATH" = false ]; then
+        domains_to_check["$SUB_DOMAIN"]=1
+    fi
+
+    handle_certificates domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" "/opt/remnawave" || return 1
+
+    PANEL_CERT_DOMAIN=$(resolve_certificate_domain "$PANEL_DOMAIN") || return 1
+    if [ "$SUB_ON_PANEL_PATH" = false ]; then
+        SUB_CERT_DOMAIN=$(resolve_certificate_domain "$SUB_DOMAIN") || return 1
+    fi
+
+    # Certbot deploy hook restarts remnawave-caddy: the container reads its
+    # certs from the bind-mounted /etc/letsencrypt tree and keeps serving
+    # the old inode until restarted.
+    for domain in "${!domains_to_check[@]}"; do
+        local lineage conf
+        lineage=$(resolve_certificate_domain "$domain" 2>/dev/null) || continue
+        conf="/etc/letsencrypt/renewal/$lineage.conf"
+        [ -f "$conf" ] || continue
+        sed -i -E 's|^deploy_hook = .*|deploy_hook = /usr/bin/docker restart remnawave-caddy 2>/dev/null \|\| true|' "$conf"
+    done
+
     echo -e "${COLOR_YELLOW}${LANG[STARTING_PANEL]}${COLOR_RESET}"
     sleep 1
     cd /opt/remnawave
-    ufw allow 80/tcp comment 'HTTP' > /dev/null 2>&1
     docker compose up -d > /dev/null 2>&1 &
-
     spinner $! "${LANG[WAITING]}"
 
     local domain_url="127.0.0.1:3000"
@@ -514,12 +566,10 @@ installation_panel_caddy() {
     sleep 20
 
     step_do "${LANG[CHECK_CONTAINERS]}"
-    local attempts=0
-    local max_attempts=5
+    local attempts=0 max_attempts=5
     until curl -s -f --max-time 30 "http://$domain_url/api/auth/status" \
         --header 'X-Forwarded-For: 127.0.0.1' \
-        --header 'X-Forwarded-Proto: https' \
-        > /dev/null; do
+        --header 'X-Forwarded-Proto: https' > /dev/null; do
         attempts=$((attempts + 1))
         if [ "$attempts" -ge "$max_attempts" ]; then
             error "$(printf "${LANG[CONTAINERS_TIMEOUT]}" $max_attempts)"
@@ -528,36 +578,31 @@ installation_panel_caddy() {
         sleep 60
     done
 
-    # Register Remnawave
-    local token=$(register_remnawave "$domain_url" "$SUPERADMIN_USERNAME" "$SUPERADMIN_PASSWORD")
+    local token
+    token=$(register_remnawave "$domain_url" "$SUPERADMIN_USERNAME" "$SUPERADMIN_PASSWORD")
     case "$token" in
         ey*) ;;
         *) abort_with_credentials "${LANG[ERROR_REGISTER]}: $token" ;;
     esac
 
-    # Drop the panel's default placeholder profile: the real profile, node,
-    # host and squad bindings are created later by the add-node menu or a
-    # panel+node install, each with its own domain.
-    delete_config_profile "$domain_url" "$token"
-
-    # Long-lived admin token for the script's own menu calls
+    # No config profile on panel-only: no local node to bind. The
+    # subscription page token still gets created for the sub-page container.
     persist_script_api_token "$domain_url" "$token"
+    create_api_token "$domain_url" "$token" "$target_dir"
 
-    if [ "$PANEL_WITH_SUB" != "false" ]; then
-        # Create API token for subscription page
-        create_api_token "$domain_url" "$token" "$target_dir"
-
-        # Stop and start Remnawave Subscription Page
-        step_do "${LANG[STOPPING_REMNAWAVE_SUBSCRIPTION_PAGE]}"
-        sleep 1
-        docker compose down remnawave-subscription-page > /dev/null 2>&1 &
-        spinner $! "${LANG[WAITING]}"
-
-        step_do "${LANG[STARTING_REMNAWAVE_SUBSCRIPTION_PAGE]}"
-        sleep 1
-        docker compose up -d remnawave-subscription-page > /dev/null 2>&1 &
-        spinner $! "${LANG[WAITING]}"
+    if [ -n "$CP_ECH_PUBLIC_CONFIG" ]; then
+        ensure_ech_subscription_templates "$domain_url" "$token" "$CP_ECH_PUBLIC_CONFIG" || true
     fi
+
+    step_do "${LANG[STOPPING_REMNAWAVE_SUBSCRIPTION_PAGE]}"
+    sleep 1
+    docker compose down remnawave-subscription-page > /dev/null 2>&1 &
+    spinner $! "${LANG[WAITING]}"
+
+    step_do "${LANG[STARTING_REMNAWAVE_SUBSCRIPTION_PAGE]}"
+    sleep 1
+    docker compose up -d remnawave-subscription-page > /dev/null 2>&1 &
+    spinner $! "${LANG[WAITING]}"
 
     clear
 
@@ -584,8 +629,27 @@ installation_panel_caddy() {
         echo -e "${COLOR_YELLOW}${LANG[PASSWORD]} ${COLOR_WHITE}$SUPERADMIN_PASSWORD${COLOR_RESET}"
     fi
     echo -e "${COLOR_YELLOW}-------------------------------------------------${COLOR_RESET}"
+    if [ "$SUB_ON_PANEL_PATH" = true ]; then
+        echo -e "${COLOR_YELLOW}${LANG[SUB_ACCESS]} https://${PANEL_DOMAIN}/sub${COLOR_RESET}"
+    else
+        echo -e "${COLOR_YELLOW}${LANG[SUB_ACCESS]} https://${SUB_DOMAIN}${COLOR_RESET}"
+    fi
+    echo -e "${COLOR_YELLOW}-------------------------------------------------${COLOR_RESET}"
     echo -e "${COLOR_YELLOW}${LANG[RELAUNCH_CMD]}${COLOR_RESET}"
     echo -e "${COLOR_GREEN}remnawave_reverse${COLOR_RESET}"
     echo -e "${COLOR_YELLOW}=================================================${COLOR_RESET}"
     echo -e "${COLOR_RED}${LANG[PANEL_ONLY_NEXT_STEP]}${COLOR_RESET}"
+
+    if [ -n "$CP_ECH_PUBLIC_CONFIG" ]; then
+        echo -e ""
+        echo -e "${COLOR_GREEN}${LANG[ECH_PUBLISH_NOTICE]}${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}${LANG[ECH_PUBLIC_LABEL]}${COLOR_RESET}"
+        echo -e "${COLOR_WHITE}${CP_ECH_PUBLIC_CONFIG}${COLOR_RESET}"
+        echo -e ""
+        echo -e "${COLOR_YELLOW}${LANG[ECH_DNS_LABEL]}${COLOR_RESET}"
+        echo -e "${COLOR_WHITE}  _https.${SELFSTEAL_DOMAIN}  IN  HTTPS  1 .  ech=${CP_ECH_PUBLIC_CONFIG}${COLOR_RESET}"
+        echo -e ""
+        echo -e "${COLOR_YELLOW}${LANG[ECH_SUB_INJECTED]}${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}=================================================${COLOR_RESET}"
+    fi
 }

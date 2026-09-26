@@ -1,8 +1,13 @@
 #!/bin/bash
-# Module: Install Node Nginx
+# Module: Install Node Only (Caddy, Xray TLS + static ECH on 443)
+#
+# Design A on a standalone node: Xray owns 443, terminates TLS for the
+# direct domain, falls back to a cleartext caddy on the shared unix socket.
+# Caddy holds no certificate; the cert tree and the static ECH key mount
+# into remnanode. The whole compose is written in one heredoc — conditional
+# content is resolved by shell variables, never patched with sed.
 
 install_node_caddy() {
-    # Load selfsteal templates module
     load_selfsteal_templates_module
 
     mkdir -p /opt/remnanode && cd /opt/remnanode
@@ -32,9 +37,7 @@ install_node_caddy() {
     CERTIFICATE=""
     while IFS= read -r line; do
         if [ -z "$line" ]; then
-            if [ -n "$CERTIFICATE" ]; then
-                break
-            fi
+            if [ -n "$CERTIFICATE" ]; then break; fi
         else
             CERTIFICATE="$CERTIFICATE$line\n"
         fi
@@ -42,6 +45,25 @@ install_node_caddy() {
 
     echo -e "${COLOR_YELLOW}${LANG[CERT_CONFIRM]}${COLOR_RESET}"
     read_yn confirm || { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
+
+    SELFSTEAL_BASE_DOMAIN=$(extract_domain "$SELFSTEAL_DOMAIN")
+    unique_domains["$SELFSTEAL_BASE_DOMAIN"]=1
+
+    # ECH key: generate once, before the compose is written, so the
+    # remnanode volume list can carry (or omit) the mount at heredoc time.
+    if ! docker image inspect remnawave/node:latest >/dev/null 2>&1; then
+        step_do "${LANG[ECH_IMAGE_PULL]}"
+        docker pull remnawave/node:latest >/dev/null 2>&1 || true
+    fi
+
+    CP_ECH_KEY_PATH=""
+    CP_ECH_PUBLIC_CONFIG=""
+    ensure_ech_server_keys "/opt/remnanode" "$SELFSTEAL_DOMAIN" || true
+
+    local ech_mount_line=""
+    if [ -n "$CP_ECH_KEY_PATH" ]; then
+        ech_mount_line="        - ./ech:/etc/xray/ech:ro"
+    fi
 
     cat > docker-compose.yml <<EOL
 x-common: &common
@@ -95,6 +117,8 @@ services:
       volumes:
         - /dev/shm:/dev/shm:rw
         - /var/log/remnanode:/var/log/remnanode
+        - /etc/letsencrypt:/etc/letsencrypt:ro
+$ech_mount_line
 
 volumes:
   caddy_data:
@@ -103,33 +127,24 @@ volumes:
     external: false
 EOL
 
+    # Cleartext Caddyfile on the socket: no auto_https, no TLS wrapper, no
+    # certificate. Xray terminated TLS on 443 above.
     cat > /opt/remnanode/Caddyfile <<EOL
 {
     admin off
+    auto_https off
     servers {
         listener_wrappers {
             proxy_protocol
-            tls
         }
     }
-    auto_https disable_redirects
 }
 
 http://{\$SELF_STEAL_DOMAIN} {
-    bind 0.0.0.0
-    redir https://{\$SELF_STEAL_DOMAIN}{uri} permanent
-}
-
-https://{\$SELF_STEAL_DOMAIN} {
     bind unix/{\$CADDY_SOCKET_PATH}
     root * /var/www/html
     try_files {path} /index.html
     file_server
-}
-
-:80 {
-    bind 0.0.0.0
-    respond 204
 }
 EOL
 }
@@ -137,10 +152,28 @@ EOL
 installation_node_caddy() {
     check_node_not_running
     check_port_443_free
+    load_certificates_module
     echo -e "${COLOR_YELLOW}${LANG[INSTALLING_NODE]}${COLOR_RESET}"
+    sleep 1
+
+    declare -A unique_domains
     install_node_caddy
 
-    ufw allow 80/tcp comment 'HTTP' > /dev/null 2>&1
+    declare -A domains_to_check
+    domains_to_check["$SELFSTEAL_DOMAIN"]=1
+
+    handle_certificates domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" "/opt/remnanode" || return 1
+
+    NODE_CERT_DOMAIN=$(resolve_certificate_domain "$SELFSTEAL_DOMAIN") || return 1
+
+    # Certbot deploy hook restarts remnanode: Xray holds the certs, and a
+    # running Xray keeps serving the old inode through its bind mounts
+    # until restarted. Caddy holds no cert.
+    local renew_conf="/etc/letsencrypt/renewal/$NODE_CERT_DOMAIN.conf"
+    if [ -f "$renew_conf" ]; then
+        sed -i -E 's|^deploy_hook = .*|deploy_hook = /usr/bin/docker restart remnanode 2>/dev/null \|\| true|' "$renew_conf"
+    fi
+
     ufw allow from $PANEL_IP to any port 2222 > /dev/null 2>&1
     ufw reload > /dev/null 2>&1
 
@@ -174,4 +207,14 @@ installation_node_caddy() {
         fi
         ((attempt++))
     done
+
+    if [ -n "$CP_ECH_PUBLIC_CONFIG" ]; then
+        echo -e ""
+        echo -e "${COLOR_GREEN}${LANG[ECH_PUBLISH_NOTICE]}${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}${LANG[ECH_PUBLIC_LABEL]}${COLOR_RESET}"
+        echo -e "${COLOR_WHITE}${CP_ECH_PUBLIC_CONFIG}${COLOR_RESET}"
+        echo -e ""
+        echo -e "${COLOR_YELLOW}${LANG[ECH_DNS_LABEL]}${COLOR_RESET}"
+        echo -e "${COLOR_WHITE}  _https.${SELFSTEAL_DOMAIN}  IN  HTTPS  1 .  ech=${CP_ECH_PUBLIC_CONFIG}${COLOR_RESET}"
+    fi
 }

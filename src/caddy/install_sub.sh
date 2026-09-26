@@ -1,5 +1,15 @@
 #!/bin/bash
 # Module: Install Subscription Page Only (Caddy)
+#
+# Standalone subscription page on its own box. No panel, no node, no Xray
+# on this server. Caddy terminates TLS on 443 and obtains its own
+# certificate via ACME on :80. The subscription page container runs on
+# loopback and is proxied by Caddy behind whatever auth the operator chose.
+#
+# Design A note: this file is unchanged from the fork. The Design A shift
+# (Xray owns 443, webserver is a cleartext reverse proxy behind it) doesn't
+# apply because there is no Xray on this box. Caddy already terminates TLS
+# on 443 here.
 
 install_sub_caddy() {
     mkdir -p /opt/subscription && cd /opt/subscription
@@ -11,7 +21,7 @@ install_sub_caddy() {
         echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
         exit 1
     fi
-    
+
     reading "${LANG[ENTER_PANEL_DOMAIN]}" PANEL_DOMAIN
     if [ -z "$PANEL_DOMAIN" ]; then
         echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
@@ -98,6 +108,7 @@ services:
       volumes:
           - ./Caddyfile:/etc/caddy/Caddyfile
           - caddy_data:/data
+      command: caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
       environment:
           - SUB_DOMAIN=${SUB_DOMAIN}
           - SUB_BACKEND_URL=127.0.0.1:3010
