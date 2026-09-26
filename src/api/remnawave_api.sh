@@ -83,11 +83,18 @@ mint_script_api_token() {
     echo "$resp" | jq -r '.response.token // empty'
 }
 
+# Persist the panel token to <install_dir>/token. Self-contained: does not
+# depend on TOKEN_FILE being set by the caller; takes the token, not a URL.
 persist_script_api_token() {
-    local tok="$1"
+    local tok="${!#}"
     [ -n "$tok" ] || return 1
-    printf '%s' "$tok" > "$TOKEN_FILE"
-    chmod 600 "$TOKEN_FILE" 2>/dev/null
+    case "$tok" in
+        http*) return 1 ;;   # caller still passing a URL as the last arg
+    esac
+    local file="${TOKEN_FILE:-${DIR_REMNAWAVE}/token}"
+    mkdir -p "$(dirname "$file")" 2>/dev/null
+    printf '%s' "$tok" > "$file"
+    chmod 600 "$file" 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -383,12 +390,16 @@ ensure_ech_server_keys() {
 # Subscription template injection
 #
 # Every XRAY_JSON subscription template body is patched to carry the static
-# ECHConfigList inside its tlsSettings blocks. The anchor is the closing quote
-# of the "serverName" value; injection adds a sibling "echConfigList" key.
-# Idempotent: templates that already contain the marker are skipped.
+# ECHConfigList inside its tlsSettings blocks. The anchor is any object that
+# has a "serverName" but no "echConfigList"; injection adds a sibling
+# "echConfigList" key. Idempotent: templates that already carry the key are
+# skipped.
+#
+# Done in jq, not sed: the ECHConfigList is base64, which contains '/' and
+# '+' and '=' — the previous `sed -e "s/…/…$ech_base64…/"` used '/' as its
+# delimiter and silently corrupted (or emptied) any template whenever the
+# key happened to contain a slash.
 # ---------------------------------------------------------------------------
-ECH_INJECT_MARKER='"echConfigList"'
-
 ensure_ech_subscription_templates() {
     local domain_url=$1
     local token=$2
@@ -431,15 +442,20 @@ ensure_ech_subscription_templates() {
         body=$(echo "$tpl" | jq -r '.response.templateJson // empty')
         [ -z "$body" ] && { failed=$((failed+1)); continue; }
 
-        if printf '%s' "$body" | grep -q "$ECH_INJECT_MARKER"; then
+        # Already carries echConfigList somewhere → nothing to do.
+        if printf '%s' "$body" | jq -e '[.. | objects | select(has("echConfigList"))] | length > 0' >/dev/null 2>&1; then
             skipped=$((skipped+1))
             continue
         fi
 
-        patched=$(printf '%s' "$body" | sed -E \
-            "s/(\"serverName\"[[:space:]]*:[[:space:]]*\"[^\"]*\")/\1,\"echConfigList\":\"$ech_base64\"/g")
+        # Inject echConfigList as a sibling of every serverName that does
+        # not already carry one. Recursive-descent update assignment.
+        patched=$(printf '%s' "$body" | jq -c --arg ech "$ech_base64" '
+            (.. | objects | select(has("serverName") and (has("echConfigList") | not)))
+            |= . + {echConfigList: $ech}
+        ' 2>/dev/null)
 
-        if [ "$patched" = "$body" ]; then
+        if [ -z "$patched" ] || [ "$patched" = "$body" ]; then
             skipped=$((skipped+1))
             continue
         fi
@@ -627,6 +643,10 @@ create_config_profile() {
         return 1
     fi
 
+    # Certificate array, deduplicated by fullchain path: in the bonded
+    # two-domain layout PANEL_CERT and DIRECT_CERT often resolve to the
+    # same wildcard lineage, and two identical entries are pointless
+    # noise the panel may or may not tolerate.
     local certs_json
     certs_json=$(jq -n \
         --arg d_cert "$direct_cert" \
@@ -641,28 +661,29 @@ create_config_profile() {
         + (if $t_cert != "" then [ { certificateFile: ("/etc/letsencrypt/live/" + $t_cert + "/fullchain.pem"),
                                      keyFile:         ("/etc/letsencrypt/live/" + $t_cert + "/privkey.pem"),
                                      ocspStapling: 3600 } ] else [] end)
+        | unique_by(.certificateFile)
     ')
 
-    local tls_json
+    # Two TLS variants: with ECH (when a key is on disk) and without.
+    # The no-ECH variant is the base — computed first, then augmented
+    # with echServerKeys only when a key exists. If the panel ever
+    # rejects the field, the no-ECH variant is the strip target.
+    local tls_json tls_json_no_ech
+    tls_json_no_ech=$(jq -n --argjson certs "$certs_json" '
+        {
+            certificates: $certs,
+            minVersion: "1.2",
+            cipherSuites: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            alpn: ["h2", "http/1.1"]
+        }')
     if [ -n "$ech_key_path" ]; then
-        tls_json=$(jq -n --argjson certs "$certs_json" --arg ech "$ech_key_path" '
-            {
-                certificates: $certs,
-                minVersion: "1.2",
-                cipherSuites: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-                alpn: ["h2", "http/1.1"],
-                echServerKeys: $ech
-            }')
+        tls_json=$(echo "$tls_json_no_ech" | jq -c --arg ech "$ech_key_path" '. + {echServerKeys: $ech}')
     else
-        tls_json=$(jq -n --argjson certs "$certs_json" '
-            {
-                certificates: $certs,
-                minVersion: "1.2",
-                cipherSuites: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-                alpn: ["h2", "http/1.1"]
-            }')
+        tls_json="$tls_json_no_ech"
     fi
 
+    # Xray-core accepts fallbacks at every TLS-terminated inbound; the
+    # list here mirrors the design's routing table exactly.
     local fallbacks_json
     fallbacks_json=$(jq -n --arg sn "$direct_domain" '[
         { name: $sn, path: "/vlws", dest: "@vless-ws",  xver: 2 },
@@ -821,6 +842,29 @@ create_config_profile() {
 
     local response
     response=$(make_api_request "POST" "http://$domain_url/api/config-profiles" "$token" "$request_body")
+
+    # Progressive-retry safety net. Xray-core accepts both echServerKeys and
+    # fallbacks at every TLS inbound, and Remnawave passes the config
+    # through unmodified, so neither retry should ever fire. If a future
+    # panel build tightens validation on top, this degrades gracefully
+    # instead of aborting an otherwise-complete install.
+    if [ -n "$response" ] && ! echo "$response" | jq -e '.response.uuid' > /dev/null 2>&1; then
+        if [ -n "$ech_key_path" ] && echo "$response" | grep -qi 'echServerKeys'; then
+            echo -e "${COLOR_YELLOW}${LANG[ECH_SCHEMA_REJECTED]:-Panel rejected echServerKeys — retrying without ECH}${COLOR_RESET}" >&2
+            request_body=$(echo "$request_body" | jq -c --argjson tls "$tls_json_no_ech" \
+                '.config.inbounds[0].streamSettings.tlsSettings = $tls')
+            response=$(make_api_request "POST" "http://$domain_url/api/config-profiles" "$token" "$request_body")
+        fi
+    fi
+
+    if [ -n "$response" ] && ! echo "$response" | jq -e '.response.uuid' > /dev/null 2>&1; then
+        if echo "$response" | grep -qi 'fallback'; then
+            echo -e "${COLOR_YELLOW}${LANG[FALLBACKS_SCHEMA_REJECTED]:-Panel rejected fallbacks — retrying without them}${COLOR_RESET}" >&2
+            request_body=$(echo "$request_body" | jq -c 'del(.config.inbounds[0].settings.fallbacks)')
+            response=$(make_api_request "POST" "http://$domain_url/api/config-profiles" "$token" "$request_body")
+        fi
+    fi
+
     if [ -z "$response" ] || ! echo "$response" | jq -e '.response.uuid' > /dev/null 2>&1; then
         err_msg "${LANG[ERROR_CREATE_CONFIG_PROFILE]}: $response"
         return 1
@@ -830,6 +874,13 @@ create_config_profile() {
     config_uuid=$(echo "$response" | jq -r '.response.uuid')
     primary_inbound_uuid=$(echo "$response" | jq -r --arg tag "$inbound_tag" \
         '.response.inbounds[] | select(.tag == $tag) | .uuid' | head -n1)
+
+    # Positional fallback: the primary TLS inbound is always first in the
+    # array this function just wrote, so `[0]` matches the pre-fork
+    # behaviour even on panel builds whose inbound metadata omits `tag`.
+    if [ -z "$primary_inbound_uuid" ] || [ "$primary_inbound_uuid" = "null" ]; then
+        primary_inbound_uuid=$(echo "$response" | jq -r '.response.inbounds[0].uuid // empty')
+    fi
 
     if [ -z "$config_uuid" ] || [ "$config_uuid" = "null" ] \
        || [ -z "$primary_inbound_uuid" ] || [ "$primary_inbound_uuid" = "null" ]; then
@@ -997,7 +1048,30 @@ create_api_token() {
         return 1
     fi
 
-    sed -i "s|REMNAWAVE_API_TOKEN=.*|REMNAWAVE_API_TOKEN=$api_token|" "$target_dir/docker-compose.yml"
+    # The compose file references REMNAWAVE_API_TOKEN=${api_token} — the
+    # substitution source is .env, so that is where the value must land.
+    # (Writing it straight into the compose used to work only because the
+    # old template had a literal placeholder; today's has none, and the
+    # sed hit nothing while Compose kept printing
+    #   WARN[0000] The "api_token" variable is not set.
+    # on every invocation.)
+    local env_file="$target_dir/.env"
+    if [ -f "$env_file" ]; then
+        if grep -q '^api_token=' "$env_file"; then
+            sed -i "s|^api_token=.*|api_token=$api_token|" "$env_file"
+        else
+            [ -n "$(tail -c1 "$env_file" 2>/dev/null)" ] && printf '\n' >> "$env_file"
+            printf 'api_token=%s\n' "$api_token" >> "$env_file"
+        fi
+        chmod 600 "$env_file" 2>/dev/null
+    fi
+
+    # Legacy safety net: only touch the compose if it still carries a
+    # LITERAL value (no leading $), i.e. an old template.
+    if grep -qE 'REMNAWAVE_API_TOKEN=[^$[:space:]]' "$target_dir/docker-compose.yml" 2>/dev/null; then
+        sed -i "s|REMNAWAVE_API_TOKEN=.*|REMNAWAVE_API_TOKEN=$api_token|" "$target_dir/docker-compose.yml"
+    fi
+
     sleep 1
 
     step_ok "${LANG[API_TOKEN_ADDED]}" >&2
