@@ -24,6 +24,13 @@
 #   /ssws  → Shadowsocks WS        (loopback 4001)
 #   /sstc  → Shadowsocks TCP obfs  (loopback 4002)
 #   *      → /dev/shm/nginx.sock   (cleartext webserver behind Xray)
+#
+# Every inbound declared here carries a unique tag derived from the primary
+# inbound tag. Remnawave's ConfigProfileInbounds table has a GLOBAL unique
+# constraint on tag (@@unique([tag])), so hardcoded fallback tags would make
+# the second profile (a second node added via add_node.sh) fail with A113.
+# Deriving "Steal-vless-ws" from "Steal" keeps the whole set unique per
+# profile and globally unique across profiles.
 
 err_msg() {
     echo -e "${COLOR_RED}$*${COLOR_RESET}" >&2
@@ -621,6 +628,14 @@ delete_config_profile() {
 #   CP_ECH_KEY_PATH         Container path of the ECH private key file
 #
 # Emits:  "<config_uuid> <primary_inbound_uuid>"
+#
+# Every inbound carries a tag. Remnawave's XRayConfig validator rejects any
+# inbound without one ("All inbounds must have a unique tag."), and the
+# ConfigProfileInbounds table enforces @@unique([tag]) panel-wide — so the
+# fallback tags are derived from the primary tag: "Steal" → "Steal-vless-ws",
+# "Steal-trojan-ws", "Steal-ss-ws" etc. Hardcoded fallback tags would pass the
+# first install and then collide with A113 the moment a second profile is
+# created (add_node.sh).
 # ---------------------------------------------------------------------------
 create_config_profile() {
     local domain_url=$1
@@ -643,6 +658,19 @@ create_config_profile() {
         return 1
     fi
 
+    # The primary inbound tag drives every fallback tag. Without it the
+    # validator rejects the first tagless inbound and the panel answers A112.
+    if [ -z "$inbound_tag" ]; then
+        err_msg "${LANG[ERROR_CREATE_CONFIG_PROFILE]}: CP_INBOUND_TAG is empty"
+        return 1
+    fi
+    case "$inbound_tag" in
+        *,*)
+            err_msg "${LANG[ERROR_CREATE_CONFIG_PROFILE]}: CP_INBOUND_TAG must not contain a comma"
+            return 1
+            ;;
+    esac
+
     # Certificate array, deduplicated by fullchain path: in the bonded
     # two-domain layout PANEL_CERT and DIRECT_CERT often resolve to the
     # same wildcard lineage, and two identical entries are pointless
@@ -664,26 +692,26 @@ create_config_profile() {
         | unique_by(.certificateFile)
     ')
 
-    # Two TLS variants: with ECH (when a key is on disk) and without.
-    # The no-ECH variant is the base — computed first, then augmented
-    # with echServerKeys only when a key exists. If the panel ever
-    # rejects the field, the no-ECH variant is the strip target.
-    local tls_json tls_json_no_ech
-    tls_json_no_ech=$(jq -n --argjson certs "$certs_json" '
-        {
-            certificates: $certs,
-            minVersion: "1.2",
-            cipherSuites: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-            alpn: ["h2", "http/1.1"]
-        }')
+    local tls_json
     if [ -n "$ech_key_path" ]; then
-        tls_json=$(echo "$tls_json_no_ech" | jq -c --arg ech "$ech_key_path" '. + {echServerKeys: $ech}')
+        tls_json=$(jq -n --argjson certs "$certs_json" --arg ech "$ech_key_path" '
+            {
+                certificates: $certs,
+                minVersion: "1.2",
+                cipherSuites: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                alpn: ["h2", "http/1.1"],
+                echServerKeys: $ech
+            }')
     else
-        tls_json="$tls_json_no_ech"
+        tls_json=$(jq -n --argjson certs "$certs_json" '
+            {
+                certificates: $certs,
+                minVersion: "1.2",
+                cipherSuites: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                alpn: ["h2", "http/1.1"]
+            }')
     fi
 
-    # Xray-core accepts fallbacks at every TLS-terminated inbound; the
-    # list here mirrors the design's routing table exactly.
     local fallbacks_json
     fallbacks_json=$(jq -n --arg sn "$direct_domain" '[
         { name: $sn, path: "/vlws", dest: "@vless-ws",  xver: 2 },
@@ -722,6 +750,7 @@ create_config_profile() {
                     streamSettings: { network: "tcp", security: "tls", tlsSettings: $tls }
                 },
                 {
+                    tag: ($tag + "-vless-ws"),
                     listen: "@vless-ws",
                     protocol: "vless",
                     settings: { clients: [], decryption: "none" },
@@ -733,6 +762,7 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
+                    tag: ($tag + "-vless-hu"),
                     listen: "@vless-hu",
                     protocol: "vless",
                     settings: { clients: [], decryption: "none" },
@@ -744,6 +774,7 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
+                    tag: ($tag + "-vless-xhttp"),
                     listen: "@vless-xhttp",
                     protocol: "vless",
                     settings: { clients: [], decryption: "none" },
@@ -755,6 +786,7 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
+                    tag: ($tag + "-vless-tcp-obfs"),
                     listen: "@vless-tcp-obfs",
                     protocol: "vless",
                     settings: { clients: [], decryption: "none" },
@@ -769,6 +801,7 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
+                    tag: ($tag + "-trojan-ws"),
                     listen: "@trojan-ws",
                     protocol: "trojan",
                     settings: { clients: [] },
@@ -780,6 +813,7 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
+                    tag: ($tag + "-trojan-hu"),
                     listen: "@trojan-hu",
                     protocol: "trojan",
                     settings: { clients: [] },
@@ -791,6 +825,7 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
+                    tag: ($tag + "-trojan-tcp-obfs"),
                     listen: "@trojan-tcp-obfs",
                     protocol: "trojan",
                     settings: { clients: [] },
@@ -805,7 +840,7 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
-                    tag: "shadowsocks-ws",
+                    tag: ($tag + "-ss-ws"),
                     listen: "127.0.0.1",
                     port: 4001,
                     protocol: "shadowsocks",
@@ -814,7 +849,7 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
-                    tag: "shadowsocks-tcp-obfs",
+                    tag: ($tag + "-ss-tcp-obfs"),
                     listen: "127.0.0.1",
                     port: 4002,
                     protocol: "shadowsocks",
@@ -843,30 +878,17 @@ create_config_profile() {
     local response
     response=$(make_api_request "POST" "http://$domain_url/api/config-profiles" "$token" "$request_body")
 
-    # Progressive-retry safety net. Xray-core accepts both echServerKeys and
-    # fallbacks at every TLS inbound, and Remnawave passes the config
-    # through unmodified, so neither retry should ever fire. If a future
-    # panel build tightens validation on top, this degrades gracefully
-    # instead of aborting an otherwise-complete install.
-    if [ -n "$response" ] && ! echo "$response" | jq -e '.response.uuid' > /dev/null 2>&1; then
-        if [ -n "$ech_key_path" ] && echo "$response" | grep -qi 'echServerKeys'; then
-            echo -e "${COLOR_YELLOW}${LANG[ECH_SCHEMA_REJECTED]:-Panel rejected echServerKeys — retrying without ECH}${COLOR_RESET}" >&2
-            request_body=$(echo "$request_body" | jq -c --argjson tls "$tls_json_no_ech" \
-                '.config.inbounds[0].streamSettings.tlsSettings = $tls')
-            response=$(make_api_request "POST" "http://$domain_url/api/config-profiles" "$token" "$request_body")
-        fi
-    fi
-
-    if [ -n "$response" ] && ! echo "$response" | jq -e '.response.uuid' > /dev/null 2>&1; then
-        if echo "$response" | grep -qi 'fallback'; then
-            echo -e "${COLOR_YELLOW}${LANG[FALLBACKS_SCHEMA_REJECTED]:-Panel rejected fallbacks — retrying without them}${COLOR_RESET}" >&2
-            request_body=$(echo "$request_body" | jq -c 'del(.config.inbounds[0].settings.fallbacks)')
-            response=$(make_api_request "POST" "http://$domain_url/api/config-profiles" "$token" "$request_body")
-        fi
-    fi
-
     if [ -z "$response" ] || ! echo "$response" | jq -e '.response.uuid' > /dev/null 2>&1; then
         err_msg "${LANG[ERROR_CREATE_CONFIG_PROFILE]}: $response"
+        # A112 is the panel's generic catch-all for any failure inside
+        # XRayConfig construction (see config-profile.service.ts). The
+        # response body names the code, never the reason — the reason is
+        # only in the panel log. Point the operator at it.
+        if echo "$response" | grep -q 'A112'; then
+            echo -e "${COLOR_YELLOW}Panel reported A112 (Create config profile error).${COLOR_RESET}" >&2
+            echo -e "${COLOR_YELLOW}The reason is in the panel log:${COLOR_RESET}" >&2
+            echo -e "${COLOR_GRAY}  cd /opt/remnawave && docker compose logs --tail=60 remnawave | grep -i 'inbound\\|tag\\|config'${COLOR_RESET}" >&2
+        fi
         return 1
     fi
 
