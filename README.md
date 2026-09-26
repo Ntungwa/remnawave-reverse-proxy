@@ -1,8 +1,8 @@
-<p aling="center"><a href="https://github.com/eGamesAPI/remnawave-reverse-proxy">
+<p aling="center"><a href="https://github.com/Ntungwa/remnawave-reverse-proxy">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="./media/logo.png" />
    <source media="(prefers-color-scheme: light)" srcset="./media/logo-black.png" />
-   <img alt="Remnawave Reverse Proxy" src="https://github.com/eGamesAPI/remnawave-reverse-proxy" />
+   <img alt="Remnawave Reverse Proxy" src="https://github.com/Ntungwa/remnawave-reverse-proxy" />
  </picture>
 </a></p>
 
@@ -12,172 +12,188 @@
 
 ---
 
-> [!CAUTION]
-> **THIS REPOSITORY IS AN EDUCATIONAL EXAMPLE FOR LEARNING NGINX, REVERSE PROXY, AND NETWORK SECURITY BASICS. THIS SCRIPT DEMONSTRATES NGINX SETUP AS A REVERSE PROXY. NOT FOR PRODUCTION AND NOT FOR PRODUCTION USE! IF YOU DON'T UNDERSTAND HOW THE CONTROL PANEL WORKS - THAT'S YOUR PROBLEM, NOT THE SCRIPT AUTHOR'S. USE AT YOUR OWN RISK!**
+[!CAUTION]
+THIS REPOSITORY IS AN EDUCATIONAL EXAMPLE FOR LEARNING NGINX, REVERSE PROXY, AND NETWORK SECURITY BASICS. THIS SCRIPT DEMONSTRATES NGINX SETUP AS A REVERSE PROXY. NOT FOR PRODUCTION AND NOT FOR PRODUCTION USE! IF YOU DON'T UNDERSTAND HOW THE CONTROL PANEL WORKS - THAT'S YOUR PROBLEM, NOT THE SCRIPT AUTHOR'S. USE AT YOUR OWN RISK!
 
 ---
 
-## Overview
+Overview
 
-This automation script simplifies the deployment of a reverse proxy server using NGINX and XRAY, as well as the installation of Remnawave control panel and node. The architecture is optimized for performance: Xray runs directly on port 443 and redirects traffic through a Unix socket that NGINX listens to, minimizing TCP overhead and improving connection reliability.
+This automation script simplifies the deployment of a reverse proxy server using NGINX and XRAY, as well as the installation of Remnawave control panel and node. The architecture is optimized for performance: Xray runs directly on port 443, terminates TLS for every public hostname, and holds the certificate chain plus a static ECH keypair. The webserver behind Xray (NGINX or Caddy) listens on a Unix socket in cleartext, minimizing TCP overhead and improving connection reliability. The Xray inbound serves VLESS, Trojan and Shadowsocks across multiple transports (WebSocket, HTTPUpgrade, XHTTP, TCP+HTTP-obfs) on the same port, routed by path fallbacks.
 
-> [!IMPORTANT]
-> Debian and Ubuntu support. The script was tested in a KVM virtualization environment. For proper operation, you will need your own domain. It is recommended to run with root privileges on a freshly installed system.
+[!IMPORTANT]
+Debian and Ubuntu support. The script was tested in a KVM virtualization environment. For proper operation, you will need your own domains. It is recommended to run with root privileges on a freshly installed system.
 
-### Deployment Modes
+Deployment Modes
 
 The script supports flexible deployment configurations:
 
-**1. Single Server Mode**
-- Control panel and XRAY node installed on one machine
-- Suitable for compact installations with moderate traffic
+1. Single Server Mode
 
-**2. Distributed Mode**
-- **Panel Server**: Management center without XRAY node
-- **Node Server**: Hosts XRAY node with SelfSteal stub for VLESS REALITY
+· Control panel and XRAY node installed on one machine
+· Suitable for compact installations with moderate traffic
 
-### Domain Requirements
+2. Distributed Mode
 
-Prepare three domains or subdomains before installation:
+· Panel Server: Management center without XRAY node
+· Node Server: Hosts XRAY node and the camouflage site on the direct domain
 
-1. **Control Panel**: Access to management interface
-2. **Subscription Page**: Client configuration distribution
-3. **SelfSteal Stub**: Camouflage website hosted on node server
+Domain Requirements
+
+Prepare two domains or subdomains before installation:
+
+1. CDN Domain: Panel UI at / and subscription page at /sub
+2. Direct Domain: Proxy hostname, camouflage site, and ECH serverName
+
+A separate subscription domain is optional and enabled by answering y to the split-subscription prompt during installation.
 
 ---
 
-## Domain Setup
+Domain Setup
 
 The script supports two methods for obtaining SSL certificates:
-- **Cloudflare**: Management through Cloudflare API
-- **ACME**: Direct integration with hosting provider
 
-### DNS Configuration Examples
+· Cloudflare: Management through Cloudflare API
+· ACME: Direct integration with hosting provider
 
-#### Single Server Installation (panel + node together)
+Gcore and Bunny.net DNS APIs are also supported for wildcard issuance.
 
-| Record Type | Name              | Value            | Proxy Status |
-|-------------|-------------------|------------------|--------------|
-| A           | example.com       | your_server_ip   | DNS only     |
-| CNAME       | panel.example.com | example.com      | DNS only     |
-| CNAME       | sub.example.com   | example.com      | DNS only     |
-| CNAME       | node.example.com  | example.com      | DNS only     |
+DNS Configuration Examples
 
-> [!TIP]
-> The `node.example.com` record is optional for SelfSteal functionality. You can use the root domain `example.com` instead.
+Single Server Installation (panel + node together)
 
-#### Distributed Installation (panel and node on different servers)
+Record Type Name Value Proxy Status
+A cdn.example.com your_server_ip Proxied
+A direct.example.org your_server_ip DNS only
 
-| Record Type | Name              | Value                | Proxy Status |
-|-------------|-------------------|----------------------|--------------|
-| A           | example.com       | panel_server_ip      | DNS only     |
-| CNAME       | panel.example.com | example.com          | DNS only     |
-| CNAME       | sub.example.com   | example.com          | DNS only     |
-| A           | node.example.com  | node_server_ip       | DNS only     |
+[!TIP]
+The CDN domain may sit behind Cloudflare (proxied). The Direct domain must stay DNS only — Xray terminates TLS on it and ECH requires a direct handshake.
+
+Distributed Installation (panel and node on different servers)
+
+Record Type Name Value Proxy Status
+A cdn.example.com panel_server_ip Proxied
+A direct.example.org node_server_ip DNS only
 
 ---
 
-## Installation Guide
+Installation Guide
 
-### Single Server Deployment
+Single Server Deployment
 
 1. Run the installation script
-2. Select **"Install Remnawave Components"**
-3. Select **"Install panel and node on one server"**
-4. Wait for completion
-5. The script will automatically restart services and display login credentials
+2. Select "Install Remnawave Components"
+3. Select "Install panel and node on one server"
+4. Enter the CDN domain, answer the split-subscription prompt (default N), enter the Direct domain
+5. Wait for completion
+6. The script will automatically restart services, display login credentials, and print the ECHConfigList to publish
 
-### Distributed Deployment
+Distributed Deployment
 
-**Step 1: Panel Server Setup**
+Step 1: Panel Server Setup
 
 1. Run the installation script on the first server
-2. Select **"Install Remnawave Components"**
-3. Select **"Install panel only"**
-4. Save the provided credentials
+2. Select "Install Remnawave Components"
+3. Select "Install panel only"
+4. Save the provided credentials and the printed ECHConfigList
 
-**Step 2: Certificate Export**
+Step 2: Certificate Export
 
 1. Log in to the control panel
-2. Navigate to **Nodes** → **Management**
+2. Navigate to Nodes → Management
 3. Select the target node
-4. Find the **"Secret Key (SECRET_KEY)"** field
+4. Find the "Secret Key (SECRET_KEY)" field
 5. Copy the certificate using the copy icon
 
-**Step 3: Node Server Setup**
+Step 3: Node Server Setup
 
 1. Run the installation script on the second server
-2. Select **"Install Remnawave Components"**
-3. Select **"Install node only"**
-4. Paste the certificate when prompted
+2. Select "Install Remnawave Components"
+3. Select "Install node only"
+4. Enter the Direct domain and paste the certificate when prompted
 5. Confirm the successful node connection message
 
 ---
 
-## Security Features
+Security Features
 
-### Panel Access Protection
+Panel Access Protection
 
 NGINX configuration implements URL parameter-based authentication to protect against unauthorized discovery:
 
-**Access Method**
+Access Method
+
 ```
-https://panel.example.com/auth/login?<SECRET_KEY>=<SECRET_KEY>
+https://cdn.example.com/auth/login?<SECRET_KEY>=<SECRET_KEY>
 ```
 
-**How It Works**
+How It Works
 
 1. URL parameter automatically sets a cookie in the browser
-   - Cookie name: `<SECRET_KEY>`
-   - Cookie value: `<SECRET_KEY>`
-
+   · Cookie name: <SECRET_KEY>
+   · Cookie value: <SECRET_KEY>
 2. Access requirements:
-   - Valid cookie must be present
-   - URL must contain correct parameter
-
+   · Valid cookie must be present
+   · URL must contain correct parameter
 3. Failed access behavior:
-   - Missing cookie: Blank page or 404 error
-   - Incorrect parameter: Blank page or 404 error
+   · Missing cookie: Blank page or 404 error
+   · Incorrect parameter: Blank page or 404 error
 
 This protection level prevents:
-- Host scanning discovery
-- Path brute-force attacks
-- Brute-force access attempts
 
-The panel remains invisible without the correct authentication parameter.
+· Host scanning discovery
+· Path brute-force attacks
+· Brute-force access attempts
 
----
+The panel remains invisible without the correct authentication parameter. Two alternative auth modes are offered at install time: TinyAuth (nginx, extra subdomain + certificate) and the Caddy auth portal (Caddy-only, built into the image, no extra domain required).
 
-## Features
+Transport Security
 
-### Proxy Server Configuration
-- Automatic configuration updates via subscription
-- JSON subscription support with format conversion for popular clients
-- Compatibility with major proxy clients
-
-### NGINX Integration
-- Optimized reverse proxy setup with XRAY
-- Unix socket communication for reduced overhead
-
-### Security Implementation
-- **Firewall**: UFW configuration for access control
-- **SSL Certificates**: Cloudflare or ACME with automatic renewal
-- **IPv6 Management**: Vulnerability prevention measures
-- **TCP Optimization**: BBR congestion control algorithm
-- **Masking**: Random website template selection
+· TLS terminated by Xray on port 443
+· ECH (Encrypted Client Hello) hides the SNI from passive observers
+· Static ECH keypair — the client-facing configuration never changes, so client configs stay valid across panel and node updates
+· Certificate hot-reload — certbot renewals restart remnanode through the deploy hook so Xray picks up the new files
 
 ---
 
-## Quick Start
+Features
+
+Proxy Server Configuration
+
+· All-in-one Xray inbound on 443 covering VLESS, Trojan and Shadowsocks across WebSocket, HTTPUpgrade, XHTTP, and TCP+HTTP-obfs
+· TLS terminated by Xray with static ECH enabled
+· Automatic configuration updates via subscription
+· JSON subscription support with format conversion for popular clients
+· Compatibility with major proxy clients
+
+NGINX Integration
+
+· Optimized reverse proxy setup with XRAY
+· Unix socket communication for reduced overhead
+· Cleartext behind Xray — the webserver holds no certificate
+
+Security Implementation
+
+· Firewall: UFW configuration for access control
+· SSL Certificates: Cloudflare / Gcore / Bunny / ACME with automatic renewal
+· IPv6 Management: Vulnerability prevention measures
+· TCP Optimization: BBR congestion control algorithm
+· Masking: Random website template selection
+
+---
+
+Quick Start
 
 Execute the following command to begin installation:
+
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/Ntungwa/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
 ```
 
 If GitHub is unreachable, use the jsDelivr mirror:
+
 ```bash
-bash <(curl -Ls https://cdn.jsdelivr.net/gh/eGamesAPI/remnawave-reverse-proxy@main/install_remnawave.sh)
+bash <(curl -Ls https://cdn.jsdelivr.net/gh/Ntungwa/remnawave-reverse-proxy@main/install_remnawave.sh)
 ```
 
 <p align="center">
@@ -186,27 +202,27 @@ bash <(curl -Ls https://cdn.jsdelivr.net/gh/eGamesAPI/remnawave-reverse-proxy@ma
 
 ---
 
-> [!CAUTION]
-> **This repository is intended solely for educational purposes and for studying the principles of reverse proxy servers and network security. The script demonstrates proxy server configuration using NGINX for reverse proxy, traffic management, and attack protection.**
->
-> **We strongly remind you that using this tool to bypass network blocks or censorship is illegal in a number of countries where laws exist regulating the use of technologies to circumvent internet restrictions.**
->
-> **This project is not intended for use in ways that violate information protection laws or interfere with censorship mechanisms. We are not responsible for any legal consequences associated with using this script.**
->
-> **Use this tool/script solely for demonstration purposes, as an example of reverse proxy operation and data protection. We strongly recommend deleting the script after familiarization. Further use is at your own risk.**
->
-> **If you are unsure whether using this tool or its components violates the laws of your country - refrain from any interaction with this tool.**
+[!CAUTION]
+This repository is intended solely for educational purposes and for studying the principles of reverse proxy servers and network security. The script demonstrates proxy server configuration using NGINX for reverse proxy, traffic management, and attack protection.
 
-## Community
+We strongly remind you that using this tool to bypass network blocks or censorship is illegal in a number of countries where laws exist regulating the use of technologies to circumvent internet restrictions.
+
+This project is not intended for use in ways that violate information protection laws or interfere with censorship mechanisms. We are not responsible for any legal consequences associated with using this script.
+
+Use this tool/script solely for demonstration purposes, as an example of reverse proxy operation and data protection. We strongly recommend deleting the script after familiarization. Further use is at your own risk.
+
+If you are unsure whether using this tool or its components violates the laws of your country - refrain from any interaction with this tool.
+
+Community
 
 Join our Telegram community for support and discussions:
 
-**Telegram chat**: [https://t.me/remnawave_reverse](https://t.me/remnawave_reverse)
+Telegram chat: https://t.me/remnawave_reverse
 
-## Donations
+Donations
 
 If you like this project and want to support its further development, please consider making a donation. Your contribution helps fund future updates and improvements!
 
-**Donation Methods:**
+Donation Methods:
 
-- **TON USDT:** `UQAxyZDwKUPQ5Bp09JOFcaDVakjYQT46rf3iP3lnl_qc9xVS`
+· TON USDT: UQAxyZDwKUPQ5Bp09JOFcaDVakjYQT46rf3iP3lnl_qc9xVS
