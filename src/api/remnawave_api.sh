@@ -14,16 +14,20 @@
 #   hostname.
 #
 # All-in-one fallbacks on 443 (VLESS primary inbound):
-#   /vlws  → VLESS WS
-#   /vhu   → VLESS HTTPUpgrade
-#   /vxh   → VLESS XHTTP
-#   /vltc  → VLESS TCP + HTTP obfs
-#   /trws  → Trojan WS
-#   /thu   → Trojan HTTPUpgrade
-#   /trtc  → Trojan TCP + HTTP obfs
-#   /ssws  → Shadowsocks WS        (loopback 4001)
-#   /sstc  → Shadowsocks TCP obfs  (loopback 4002)
-#   *      → /dev/shm/nginx.sock   (cleartext webserver behind Xray)
+#   /vlws  → VLESS WS         (127.0.0.1:4003)
+#   /vhu   → VLESS HTTPUpgrade (127.0.0.1:4004)
+#   /vxh   → VLESS XHTTP       (127.0.0.1:4005)
+#   /vltc  → VLESS TCP+obfs    (127.0.0.1:4006)
+#   /trws  → Trojan WS         (127.0.0.1:4007)
+#   /thu   → Trojan HTTPUpgrade (127.0.0.1:4008)
+#   /trtc  → Trojan TCP+obfs   (127.0.0.1:4009)
+#   /ssws  → Shadowsocks WS    (127.0.0.1:4001)
+#   /sstc  → Shadowsocks TCP+obfs (127.0.0.1:4002)
+#   *      → /dev/shm/nginx.sock (cleartext webserver behind Xray)
+#
+# The panel's Zod schema rejects abstract unix socket inbounds (@name) because
+# they carry no port number. Every auxiliary inbound therefore uses a real
+# loopback port, and the fallbacks target those ports numerically.
 
 err_msg() {
     echo -e "${COLOR_RED}$*${COLOR_RESET}" >&2
@@ -594,7 +598,7 @@ create_config_profile() {
         return 1
     fi
 
-    # Certificate array. Xray picks by SNI. Direct first (ECH serverName).
+    # Certificate array — one entry per public hostname Xray serves.
     local certs_json
     certs_json=$(jq -n \
         --arg d_cert "$direct_cert" \
@@ -610,23 +614,6 @@ create_config_profile() {
                                      keyFile:         ("/etc/letsencrypt/live/" + $t_cert + "/privkey.pem"),
                                      ocspStapling: 3600 } ] else [] end)
     ')
-
-    # Fallbacks. Proxy paths are scoped to the direct SNI. Everything else
-    # (panel SNI, tinyauth SNI, direct SNI without a matching path) falls to
-    # the single cleartext webserver socket.
-    local fallbacks_json
-    fallbacks_json=$(jq -n --arg sn "$direct_domain" '[
-        { name: $sn, path: "/vlws", dest: "@vless-ws",         xver: 2 },
-        { name: $sn, path: "/vhu",  dest: "@vless-hu",         xver: 2 },
-        { name: $sn, path: "/vxh",  dest: "@vless-xhttp",      xver: 2 },
-        { name: $sn, path: "/vltc", dest: "@vless-tcp-obfs",   xver: 2 },
-        { name: $sn, path: "/trws", dest: "@trojan-ws",        xver: 2 },
-        { name: $sn, path: "/thu",  dest: "@trojan-hu",        xver: 2 },
-        { name: $sn, path: "/trtc", dest: "@trojan-tcp-obfs",  xver: 2 },
-        { name: $sn, path: "/ssws", dest: 4001 },
-        { name: $sn, path: "/sstc", dest: 4002 },
-        { dest: "/dev/shm/nginx.sock", xver: 2 }
-    ]')
 
     local tls_json
     if [ -n "$ech_key_path" ]; then
@@ -648,6 +635,23 @@ create_config_profile() {
             }')
     fi
 
+    # Fallbacks point at concrete loopback ports. The panel's Zod schema
+    # rejects abstract unix socket inbounds (@name) because they carry no
+    # port number, so every auxiliary inbound below uses 127.0.0.1:N.
+    local fallbacks_json
+    fallbacks_json=$(jq -n --arg sn "$direct_domain" '[
+        { name: $sn, path: "/vlws", dest: 4003, xver: 2 },
+        { name: $sn, path: "/vhu",  dest: 4004, xver: 2 },
+        { name: $sn, path: "/vxh",  dest: 4005 },
+        { name: $sn, path: "/vltc", dest: 4006, xver: 2 },
+        { name: $sn, path: "/trws", dest: 4007, xver: 2 },
+        { name: $sn, path: "/thu",  dest: 4008, xver: 2 },
+        { name: $sn, path: "/trtc", dest: 4009, xver: 2 },
+        { name: $sn, path: "/ssws", dest: 4001 },
+        { name: $sn, path: "/sstc", dest: 4002 },
+        { dest: "/dev/shm/nginx.sock", xver: 2 }
+    ]')
+
     local request_body
     request_body=$(jq -n \
         --arg name "$name" \
@@ -658,21 +662,38 @@ create_config_profile() {
         name: $name,
         config: {
             log: { loglevel: "warning" },
-            dns: {
-                queryStrategy: "UseIPv4",
-                servers: [{ address: "https://dns.google/dns-query", skipFallback: false }]
-            },
             inbounds: [
                 {
                     tag: $tag,
                     port: 443,
                     protocol: "vless",
                     settings: { clients: [], decryption: "none", fallbacks: $fallbacks },
-                    sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] },
+                    sniffing: { enabled: true, destOverride: ["http", "tls"] },
                     streamSettings: { network: "tcp", security: "tls", tlsSettings: $tls }
                 },
                 {
-                    listen: "@vless-ws",
+                    listen: "127.0.0.1",
+                    port: 4001,
+                    protocol: "shadowsocks",
+                    settings: { method: "chacha20-ietf-poly1305", clients: [] },
+                    streamSettings: { network: "ws", security: "none", wsSettings: { path: "/ssws" } },
+                    sniffing: { enabled: true, destOverride: ["http", "tls"] }
+                },
+                {
+                    listen: "127.0.0.1",
+                    port: 4002,
+                    protocol: "shadowsocks",
+                    settings: { method: "chacha20-ietf-poly1305", clients: [] },
+                    streamSettings: {
+                        network: "tcp",
+                        security: "none",
+                        tcpSettings: { header: { type: "http", request: { path: ["/sstc"] } } }
+                    },
+                    sniffing: { enabled: true, destOverride: ["http", "tls"] }
+                },
+                {
+                    listen: "127.0.0.1",
+                    port: 4003,
                     protocol: "vless",
                     settings: { clients: [], decryption: "none" },
                     streamSettings: {
@@ -683,7 +704,8 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
-                    listen: "@vless-hu",
+                    listen: "127.0.0.1",
+                    port: 4004,
                     protocol: "vless",
                     settings: { clients: [], decryption: "none" },
                     streamSettings: {
@@ -694,18 +716,20 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
-                    listen: "@vless-xhttp",
+                    listen: "127.0.0.1",
+                    port: 4005,
                     protocol: "vless",
                     settings: { clients: [], decryption: "none" },
                     streamSettings: {
                         network: "xhttp",
                         security: "none",
-                        xhttpSettings: { path: "/vxh", mode: "auto" }
+                        xhttpSettings: { path: "/vxh" }
                     },
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
-                    listen: "@vless-tcp-obfs",
+                    listen: "127.0.0.1",
+                    port: 4006,
                     protocol: "vless",
                     settings: { clients: [], decryption: "none" },
                     streamSettings: {
@@ -719,7 +743,8 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
-                    listen: "@trojan-ws",
+                    listen: "127.0.0.1",
+                    port: 4007,
                     protocol: "trojan",
                     settings: { clients: [] },
                     streamSettings: {
@@ -730,7 +755,8 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
-                    listen: "@trojan-hu",
+                    listen: "127.0.0.1",
+                    port: 4008,
                     protocol: "trojan",
                     settings: { clients: [] },
                     streamSettings: {
@@ -741,7 +767,8 @@ create_config_profile() {
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 },
                 {
-                    listen: "@trojan-tcp-obfs",
+                    listen: "127.0.0.1",
+                    port: 4009,
                     protocol: "trojan",
                     settings: { clients: [] },
                     streamSettings: {
@@ -751,28 +778,6 @@ create_config_profile() {
                             acceptProxyProtocol: true,
                             header: { type: "http", request: { path: ["/trtc"] } }
                         }
-                    },
-                    sniffing: { enabled: true, destOverride: ["http", "tls"] }
-                },
-                {
-                    tag: "shadowsocks-ws",
-                    listen: "127.0.0.1",
-                    port: 4001,
-                    protocol: "shadowsocks",
-                    settings: { method: "chacha20-ietf-poly1305", clients: [] },
-                    streamSettings: { network: "ws", security: "none", wsSettings: { path: "/ssws" } },
-                    sniffing: { enabled: true, destOverride: ["http", "tls"] }
-                },
-                {
-                    tag: "shadowsocks-tcp-obfs",
-                    listen: "127.0.0.1",
-                    port: 4002,
-                    protocol: "shadowsocks",
-                    settings: { method: "chacha20-ietf-poly1305", clients: [] },
-                    streamSettings: {
-                        network: "tcp",
-                        security: "none",
-                        tcpSettings: { header: { type: "http", request: { path: ["/sstc"] } } }
                     },
                     sniffing: { enabled: true, destOverride: ["http", "tls"] }
                 }
