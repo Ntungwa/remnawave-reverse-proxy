@@ -1,41 +1,30 @@
 #!/bin/bash
 # Module: Install Panel + Node (Caddy, Xray TLS + static ECH on 443)
 #
-# Design A: Xray (inside remnanode) terminates TLS on 443 for every SNI and
-# holds every certificate plus the static ECH key. Caddy sits on a cleartext
-# unix socket behind Xray and holds no certificate at all — auto_https is
-# off globally, TLS is dropped from the listener wrapper.
+# Design A: Xray owns 443, Caddy is a cleartext reverse proxy on a unix
+# socket behind it. Every reverse_proxy sends X-Forwarded-Proto: https —
+# the panel and subscription page both run ProxyCheckMiddleware.
 #
-# Domain layout:
-#   default (bonded): 2 domains — CDN (panel + /sub) and Direct (proxy).
-#   optional split:   3 domains — panel, sub, direct.
+# Panel block uses handle /sub/* FIRST so the @unauthorized block cannot
+# serve the camouflage to /sub/ requests.
 #
-# The whole compose is written in one heredoc — conditional content is
-# resolved by shell variables, never patched with sed.
+# ECH server key is passed INLINE (base64) to the config profile.
 #
-# Every reverse_proxy block that reaches the Remnawave backend sends
-# X-Forwarded-Proto: https. The backend's ProxyCheckMiddleware refuses
-# requests without it ("Reverse proxy and HTTPS are required"), which
-# surfaces as a 502 through Caddy. The subscription page does not enforce
-# this, but the header is sent to it too for consistency.
+# Fallback inbounds: one visible host (tag = CP_INBOUND_TAG) plus one
+# hidden host per fallback inbound, all sharing the same tag. The
+# subscription template's remnawave.injectHosts directive injects the
+# hidden hosts as outbounds for every client.
 #
-# The panel's healthcheck uses start_period: 900s. Nest+Prisma boot on this
-# layout can exceed the old 30s+3×30s window on slow disks, and a failing
-# healthcheck blocks caddy and the subscription page via depends_on —
-# making an otherwise-fine install look dead.
+# Panel healthcheck start_period 900s — Nest+Prisma boot can exceed 30s.
+# Credential banner runs even when the final docker compose up fails.
 
 install_panel_node_caddy() {
     load_selfsteal_templates_module
-
     mkdir -p /opt/remnawave && cd /opt/remnawave
 
     reading "${LANG[ENTER_PANEL_DOMAIN]}" PANEL_DOMAIN
     check_domain "$PANEL_DOMAIN" true true
-    local panel_check_result=$?
-    if [ $panel_check_result -eq 2 ]; then
-        echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
-        exit 1
-    fi
+    [ $? -eq 2 ] && { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
 
     local split_sub="n"
     printf ' %s' "$(question "${LANG[SUB_ON_PANEL_PATH_ASK]}")"
@@ -46,11 +35,7 @@ install_panel_node_caddy() {
         SUB_ON_PANEL_PATH=false
         reading "${LANG[ENTER_SUB_DOMAIN]}" SUB_DOMAIN
         check_domain "$SUB_DOMAIN" true true
-        local sub_check_result=$?
-        if [ $sub_check_result -eq 2 ]; then
-            echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
-            exit 1
-        fi
+        [ $? -eq 2 ] && { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
     else
         SUB_ON_PANEL_PATH=true
         SUB_DOMAIN="$PANEL_DOMAIN"
@@ -58,20 +43,14 @@ install_panel_node_caddy() {
 
     reading "${LANG[ENTER_NODE_DOMAIN]}" SELFSTEAL_DOMAIN
     check_domain "$SELFSTEAL_DOMAIN" true false
-    local node_check_result=$?
-    if [ $node_check_result -eq 2 ]; then
-        echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
-        exit 1
-    fi
+    [ $? -eq 2 ] && { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
 
     if [ "$PANEL_DOMAIN" = "$SELFSTEAL_DOMAIN" ] || [ "$SUB_DOMAIN" = "$SELFSTEAL_DOMAIN" ]; then
-        echo -e "${COLOR_RED}${LANG[DOMAINS_MUST_BE_UNIQUE]}${COLOR_RESET}"
-        exit 1
+        echo -e "${COLOR_RED}${LANG[DOMAINS_MUST_BE_UNIQUE]}${COLOR_RESET}"; exit 1
     fi
 
     PANEL_BASE_DOMAIN=$(extract_domain "$PANEL_DOMAIN")
     SELFSTEAL_BASE_DOMAIN=$(extract_domain "$SELFSTEAL_DOMAIN")
-
     unique_domains["$PANEL_BASE_DOMAIN"]=1
     unique_domains["$SELFSTEAL_BASE_DOMAIN"]=1
     if [ "$SUB_ON_PANEL_PATH" = false ]; then
@@ -83,33 +62,24 @@ install_panel_node_caddy() {
     CADDY_IMAGE="caddy:2.11.4"
     AUTHP_ENV=""
     while true; do
-        echo -e ""
-        echo -e "${COLOR_GREEN}${LANG[PANEL_AUTH_PROMPT]}${COLOR_RESET}"
-        echo -e ""
+        echo -e ""; echo -e "${COLOR_GREEN}${LANG[PANEL_AUTH_PROMPT]}${COLOR_RESET}"; echo -e ""
         echo -e "${COLOR_YELLOW}1. ${LANG[PANEL_AUTH_OPT_COOKIE]}${COLOR_RESET}"
         echo -e "${COLOR_YELLOW}2. ${LANG[PANEL_AUTH_OPT_PORTAL]}${COLOR_RESET}"
         echo -e ""
         reading "${LANG[PANEL_AUTH_PROMPT_CHOOSE]}" auth_choice
         case "$auth_choice" in
             1) break ;;
-            2)
-                PANEL_AUTH_MODE=portal
-                CADDY_IMAGE="remnawave/caddy-with-auth:latest"
-                break
-                ;;
+            2) PANEL_AUTH_MODE=portal; CADDY_IMAGE="remnawave/caddy-with-auth:latest"; break ;;
             *) echo -e "${COLOR_RED}${LANG[CERT_INVALID_CHOICE]}${COLOR_RESET}" ;;
         esac
     done
 
     SUPERADMIN_USERNAME=$(generate_user)
     SUPERADMIN_PASSWORD=$(generate_password)
-
     cookies_random1=$(generate_user)
     cookies_random2=$(generate_user)
-
     METRICS_USER=$(generate_user)
     METRICS_PASS=$(generate_user)
-
     APP_SECRET=$(openssl rand -hex 64)
 
     if [ "$PANEL_AUTH_MODE" = "portal" ]; then
@@ -122,11 +92,9 @@ install_panel_node_caddy() {
 
     local sub_public_domain sub_custom_prefix
     if [ "$SUB_ON_PANEL_PATH" = true ]; then
-        sub_public_domain="${PANEL_DOMAIN}/sub"
-        sub_custom_prefix="/sub"
+        sub_public_domain="${PANEL_DOMAIN}/sub"; sub_custom_prefix="/sub"
     else
-        sub_public_domain="$SUB_DOMAIN"
-        sub_custom_prefix=""
+        sub_public_domain="$SUB_DOMAIN"; sub_custom_prefix=""
     fi
 
     if ! docker image inspect remnawave/node:latest >/dev/null 2>&1; then
@@ -134,15 +102,11 @@ install_panel_node_caddy() {
         docker pull remnawave/node:latest >/dev/null 2>&1 || true
     fi
 
-    CP_ECH_KEY_PATH=""
-    CP_ECH_SERVER_KEYS_B64=""
-    CP_ECH_PUBLIC_CONFIG=""
+    CP_ECH_KEY_PATH=""; CP_ECH_SERVER_KEYS_B64=""; CP_ECH_PUBLIC_CONFIG=""
     ensure_ech_server_keys "/opt/remnawave" "$SELFSTEAL_DOMAIN" || true
 
     local ech_mount_line=""
-    if [ -n "$CP_ECH_KEY_PATH" ]; then
-        ech_mount_line="      - ./ech:/etc/xray/ech:ro"
-    fi
+    [ -n "$CP_ECH_KEY_PATH" ] && ech_mount_line="      - ./ech:/etc/xray/ech:ro"
 
     cat > .env <<EOL
 ### APP ###
@@ -267,9 +231,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      # Nest+Prisma boot occasionally exceeds the old 30s+3×30s window on
-      # small disks; a shorter value blocked caddy and the subscription page
-      # via depends_on while the backend was still coming up.
       start_period: 900s
     depends_on:
       remnawave-db:
@@ -386,7 +347,6 @@ volumes:
     external: false
 EOL
 
-    # ---- Caddyfile ------------------------------------------------------
     if [ "$PANEL_AUTH_MODE" = "portal" ]; then
         cat > /opt/remnawave/Caddyfile <<EOL
 {
@@ -429,16 +389,8 @@ EOL
             set auth url /r
             allow roles authp/admin
             with api key auth portal remnawaveportal realm local
-            acl rule {
-                comment "Accept"
-                match role authp/admin
-                allow stop log info
-            }
-            acl rule {
-                comment "Deny"
-                match any
-                deny log warn
-            }
+            acl rule { comment "Accept"  match role authp/admin  allow stop log info }
+            acl rule { comment "Deny"    match any              deny log warn }
         }
     }
 }
@@ -478,7 +430,7 @@ http://{\$PANEL_DOMAIN} {
     bind unix/{\$CADDY_SOCKET_PATH}
     encode
 
-    route /sub/* {
+    handle /sub/* {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
@@ -486,14 +438,14 @@ http://{\$PANEL_DOMAIN} {
         }
     }
 
-    route /api/* {
+    handle /api/* {
         reverse_proxy {\$BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
             header_up X-Forwarded-Proto https
         }
     }
-    route /oauth2/* {
+    handle /oauth2/* {
         reverse_proxy {\$BACKEND_URL} {
             header_up Host {host}
             header_up X-Forwarded-Proto https
@@ -505,10 +457,10 @@ http://{\$PANEL_DOMAIN} {
         request_header +X-Forwarded-Prefix /r
         authenticate with remnawaveportal
     }
-    route /r* {
+    handle /r* {
         authenticate with remnawaveportal
     }
-    route /* {
+    handle {
         authorize with panelpolicy
         reverse_proxy {\$BACKEND_URL} {
             header_up X-Real-IP {remote}
@@ -525,9 +477,16 @@ http://{\$PANEL_DOMAIN} {
     bind unix/{\$CADDY_SOCKET_PATH}
     encode
 
-    route /sub/* {
+    handle /sub/* {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
+            header_up Host {host}
+            header_up X-Forwarded-Proto https
+        }
+    }
+
+    handle /oauth2/* {
+        reverse_proxy {\$BACKEND_URL} {
             header_up Host {host}
             header_up X-Forwarded-Proto https
         }
@@ -538,10 +497,14 @@ http://{\$PANEL_DOMAIN} {
     }
     handle @has_token_param {
         header +Set-Cookie "$cookies_random1=$cookies_random2; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000"
+        reverse_proxy {\$BACKEND_URL} {
+            header_up X-Real-IP {remote}
+            header_up Host {host}
+            header_up X-Forwarded-Proto https
+        }
     }
 
     @unauthorized {
-        not path /oauth2/*
         not header Cookie *$cookies_random1=$cookies_random2*
         not query $cookies_random1=$cookies_random2
     }
@@ -551,21 +514,12 @@ http://{\$PANEL_DOMAIN} {
         file_server
     }
 
-    @oauth2_callback {
-        path /oauth2/*
-        query code=* state=*
-    }
-    handle @oauth2_callback {
+    handle {
         reverse_proxy {\$BACKEND_URL} {
+            header_up X-Real-IP {remote}
             header_up Host {host}
             header_up X-Forwarded-Proto https
         }
-    }
-
-    reverse_proxy {\$BACKEND_URL} {
-        header_up X-Real-IP {remote}
-        header_up Host {host}
-        header_up X-Forwarded-Proto https
     }
 }
 EOL
@@ -602,17 +556,13 @@ installation_panel_node_caddy() {
 
     declare -A domains_to_check
     domains_to_check["$PANEL_DOMAIN"]=1
-    if [ "$SUB_ON_PANEL_PATH" = false ]; then
-        domains_to_check["$SUB_DOMAIN"]=1
-    fi
+    [ "$SUB_ON_PANEL_PATH" = false ] && domains_to_check["$SUB_DOMAIN"]=1
     domains_to_check["$SELFSTEAL_DOMAIN"]=1
 
     handle_certificates domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" "/opt/remnawave" || return 1
 
     PANEL_CERT_DOMAIN=$(resolve_certificate_domain "$PANEL_DOMAIN") || return 1
-    if [ "$SUB_ON_PANEL_PATH" = false ]; then
-        SUB_CERT_DOMAIN=$(resolve_certificate_domain "$SUB_DOMAIN") || return 1
-    fi
+    [ "$SUB_ON_PANEL_PATH" = false ] && { SUB_CERT_DOMAIN=$(resolve_certificate_domain "$SUB_DOMAIN") || return 1; }
     NODE_CERT_DOMAIN=$(resolve_certificate_domain "$SELFSTEAL_DOMAIN") || return 1
 
     for domain in "${!domains_to_check[@]}"; do
@@ -642,44 +592,79 @@ installation_panel_node_caddy() {
         --header 'X-Forwarded-For: 127.0.0.1' \
         --header 'X-Forwarded-Proto: https' > /dev/null; do
         attempts=$((attempts + 1))
-        if [ "$attempts" -ge "$max_attempts" ]; then
-            error "$(printf "${LANG[CONTAINERS_TIMEOUT]}" $max_attempts)"
-        fi
+        [ "$attempts" -ge "$max_attempts" ] && error "$(printf "${LANG[CONTAINERS_TIMEOUT]}" $max_attempts)"
         echo -e "${COLOR_RED}$(printf "${LANG[CONTAINERS_NOT_READY_ATTEMPT]}" $attempts $max_attempts)${COLOR_RESET}"
         sleep 60
     done
 
     local token
     token=$(register_remnawave "$domain_url" "$SUPERADMIN_USERNAME" "$SUPERADMIN_PASSWORD")
-    case "$token" in
-        ey*) ;;
-        *) abort_with_credentials "${LANG[ERROR_REGISTER]}: $token" ;;
-    esac
+    case "$token" in ey*) ;; *) abort_with_credentials "${LANG[ERROR_REGISTER]}: $token" ;; esac
 
     sleep 1
     get_public_key "$domain_url" "$token" "$target_dir" || abort_with_credentials "${LANG[ERROR_EXTRACT_PUBLIC_KEY]}"
 
     delete_config_profile "$domain_url" "$token"
 
-    CP_PROFILE_NAME="StealConfig"
-    CP_INBOUND_TAG="Steal"
-    CP_DIRECT_DOMAIN="$SELFSTEAL_DOMAIN"
-    CP_DIRECT_CERT="$NODE_CERT_DOMAIN"
-    CP_PANEL_DOMAIN="$PANEL_DOMAIN"
-    CP_PANEL_CERT="$PANEL_CERT_DOMAIN"
-    CP_TINYAUTH_DOMAIN=""
-    CP_TINYAUTH_CERT=""
+    CP_PROFILE_NAME="StealConfig"; CP_INBOUND_TAG="Steal"
+    CP_DIRECT_DOMAIN="$SELFSTEAL_DOMAIN"; CP_DIRECT_CERT="$NODE_CERT_DOMAIN"
+    CP_PANEL_DOMAIN="$PANEL_DOMAIN"; CP_PANEL_CERT="$PANEL_CERT_DOMAIN"
+    CP_TINYAUTH_DOMAIN=""; CP_TINYAUTH_CERT=""
 
     local profile_output
     profile_output=$(create_config_profile "$domain_url" "$token") || abort_with_credentials "${LANG[ERROR_CREATE_CONFIG_PROFILE]}"
-    read -r config_profile_uuid inbound_uuid <<< "$profile_output"
 
-    create_node "$domain_url" "$token" "$config_profile_uuid" "$inbound_uuid" || abort_with_credentials "${LANG[ERROR_CREATE_NODE]}"
-    create_host "$domain_url" "$token" "$inbound_uuid" "$SELFSTEAL_DOMAIN" "$config_profile_uuid" || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}"
+    local config_profile_uuid
+    config_profile_uuid=$(echo "$profile_output" | head -n1)
+    local inbound_lines
+    inbound_lines=$(echo "$profile_output" | tail -n +2)
+    if [ -z "$config_profile_uuid" ] || [ -z "$inbound_lines" ]; then
+        abort_with_credentials "${LANG[ERROR_CREATE_CONFIG_PROFILE]}: empty profile output"
+    fi
+
+    # Primary visible host.
+    local primary_inbound_uuid=""
+    while IFS=: read -r inb_tag inb_uuid; do
+        [ -z "$inb_uuid" ] && continue
+        [ "$inb_tag" = "$CP_INBOUND_TAG" ] || continue
+        create_host "$domain_url" "$token" "$inb_uuid" "$SELFSTEAL_DOMAIN" \
+            "$config_profile_uuid" "Steal" "$CP_INBOUND_TAG" "false" \
+            || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}"
+        primary_inbound_uuid="$inb_uuid"
+        break
+    done <<< "$inbound_lines"
+    [ -n "$primary_inbound_uuid" ] || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}: primary inbound missing"
+
+    create_node "$domain_url" "$token" "$config_profile_uuid" "$primary_inbound_uuid" \
+        || abort_with_credentials "${LANG[ERROR_CREATE_NODE]}"
+
+    # Hidden hosts for the fallbacks.
+    while IFS=: read -r inb_tag inb_uuid; do
+        [ -z "$inb_uuid" ] && continue
+        [ "$inb_tag" = "$CP_INBOUND_TAG" ] && continue
+        local remark="$inb_tag"
+        case "$inb_tag" in
+            *-vless-ws)        remark="Steal-vless-ws" ;;
+            *-vless-hu)        remark="Steal-vless-hu" ;;
+            *-vless-xhttp)     remark="Steal-vless-xhttp" ;;
+            *-vless-tcp-obfs)  remark="Steal-vless-tcp-obfs" ;;
+            *-trojan-ws)       remark="Steal-trojan-ws" ;;
+            *-trojan-hu)       remark="Steal-trojan-hu" ;;
+            *-trojan-tcp-obfs) remark="Steal-trojan-tcp-obfs" ;;
+            *-ss-ws)           remark="Steal-ss-ws" ;;
+            *-ss-tcp-obfs)     remark="Steal-ss-tcp-obfs" ;;
+        esac
+        create_host "$domain_url" "$token" "$inb_uuid" "$SELFSTEAL_DOMAIN" \
+            "$config_profile_uuid" "$remark" "$CP_INBOUND_TAG" "true" \
+            || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}"
+    done <<< "$inbound_lines"
 
     local squad_uuid
     squad_uuid=$(get_default_squad "$domain_url" "$token")
-    update_squad "$domain_url" "$token" "$squad_uuid" "$inbound_uuid"
+    while IFS=: read -r inb_tag inb_uuid; do
+        [ -z "$inb_uuid" ] && continue
+        update_squad "$domain_url" "$token" "$squad_uuid" "$inb_uuid"
+    done <<< "$inbound_lines"
 
     persist_script_api_token "$token"
     create_api_token "$domain_url" "$token" "$target_dir"
@@ -688,15 +673,14 @@ installation_panel_node_caddy() {
         ensure_ech_subscription_templates "$domain_url" "$token" "$CP_ECH_PUBLIC_CONFIG" || true
     fi
 
+    ensure_subscription_template_inject "$domain_url" "$token" || true
+
     step_do "${LANG[STOPPING_REMNAWAVE]}"
     sleep 1
     docker compose down > /dev/null 2>&1
 
     step_do "${LANG[STARTING_PANEL_NODE]}"
     sleep 1
-    # A failed final `up` used to `return 1` before the credential banner ran,
-    # losing the admin password forever. abort_with_credentials prints the
-    # banner before exiting, so the operator always gets the credentials.
     if ! docker compose up -d > /dev/null 2>&1; then
         abort_with_credentials "$(printf "${LANG[COMPOSE_UP_FAIL]}" "/opt/remnawave" "/opt/remnawave")"
     fi
