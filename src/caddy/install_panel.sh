@@ -11,8 +11,10 @@
 #   default (bonded): 2 domains — CDN (panel + /sub) and Direct.
 #   optional split:   3 domains — panel, sub, direct.
 #
-# The whole compose is written in one heredoc — conditional content is
-# resolved by shell variables, never patched with sed.
+# Every reverse_proxy that reaches the Remnawave backend sends
+# X-Forwarded-Proto: https — the backend's ProxyCheckMiddleware rejects
+# requests without it ("Reverse proxy and HTTPS are required"), which
+# surfaces as a 502.
 
 install_panel_caddy() {
     mkdir -p /opt/remnawave && cd /opt/remnawave
@@ -25,7 +27,6 @@ install_panel_caddy() {
         exit 1
     fi
 
-    # Bonded is the default: the sub page lives on the CDN domain at /sub.
     local split_sub="n"
     printf ' %s' "$(question "${LANG[SUB_ON_PANEL_PATH_ASK]}")"
     read_yn split_sub || true
@@ -45,9 +46,6 @@ install_panel_caddy() {
         SUB_DOMAIN="$PANEL_DOMAIN"
     fi
 
-    # The direct domain is asked here even though nothing on this box serves
-    # it: the ECH keypair binds to this hostname, and the operator will
-    # point remote nodes at the same name later.
     reading "${LANG[ENTER_NODE_DOMAIN]}" SELFSTEAL_DOMAIN
     if ! [[ "$SELFSTEAL_DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; then
         echo -e "${COLOR_RED}${LANG[CERT_MANUAL_BAD_DOMAIN]}${COLOR_RESET}"
@@ -108,8 +106,6 @@ install_panel_caddy() {
             "$AUTHP_ADMIN_USER" "$AUTHP_ADMIN_EMAIL" "$AUTHP_ADMIN_SECRET")
     fi
 
-    # SUB_PUBLIC_DOMAIN carries the /sub suffix when bonded. The sub-page
-    # container is given CUSTOM_SUB_PREFIX=/sub so it expects the same path.
     local sub_public_domain sub_custom_prefix
     if [ "$SUB_ON_PANEL_PATH" = true ]; then
         sub_public_domain="${PANEL_DOMAIN}/sub"
@@ -119,11 +115,6 @@ install_panel_caddy() {
         sub_custom_prefix=""
     fi
 
-    # ---- ECH key --------------------------------------------------------
-    # Generated before the compose is written. On panel-only there is no
-    # local Xray to serve it — the key is what the panel will inject into
-    # every XRAY_JSON subscription template for its remote nodes. Requires
-    # the node image on disk; pulled once here.
     if ! docker image inspect remnawave/node:latest >/dev/null 2>&1; then
         step_do "${LANG[ECH_IMAGE_PULL]}"
         docker pull remnawave/node:latest >/dev/null 2>&1 || true
@@ -133,7 +124,6 @@ install_panel_caddy() {
     CP_ECH_PUBLIC_CONFIG=""
     ensure_ech_server_keys "/opt/remnawave" "$SELFSTEAL_DOMAIN" || true
 
-    # ---- .env -----------------------------------------------------------
     cat > .env <<EOL
 ### APP ###
 APP_PORT=3000
@@ -189,13 +179,15 @@ BANDWIDTH_USAGE_NOTIFICATIONS_THRESHOLD=[60, 80]
 NOT_CONNECTED_USERS_NOTIFICATIONS_ENABLED=false
 NOT_CONNECTED_USERS_NOTIFICATIONS_AFTER_HOURS=[6, 24, 48]
 
+### Subscription-page API token (minted after the panel is registered) ###
+api_token=
+
 ### Database ###
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
 POSTGRES_DB=postgres
 EOL
 
-    # ---- docker-compose.yml ---------------------------------------------
     cat > docker-compose.yml <<EOL
 x-common: &common
   ulimits:
@@ -284,9 +276,6 @@ services:
       timeout: 10s
       retries: 3
 
-  # No Xray on this box: Caddy owns 443 and terminates TLS itself with the
-  # panel and sub certificates. This is the one installer where Caddy holds
-  # the certs.
   remnawave-caddy:
       image: ${CADDY_IMAGE}
       container_name: remnawave-caddy
@@ -310,16 +299,6 @@ services:
           timeout: 5s
           retries: 6
           start_period: 5s
-EOL
-
-    if [ "$SUB_ON_PANEL_PATH" = false ]; then
-        # Split subscription: separate container env, separate site later.
-        :
-    fi
-
-    # Caddy always serves the sub-page container on this box, whether the
-    # sub lives at /sub (bonded) or on its own hostname (split).
-    cat >> docker-compose.yml <<EOL
 
   remnawave-subscription-page:
     image: remnawave/subscription-page:latest
@@ -358,11 +337,6 @@ volumes:
     external: false
 EOL
 
-    # ---- Caddyfile ------------------------------------------------------
-    # Caddy terminates TLS on 443 and serves its own ACME-managed certs from
-    # the caddy_data volume. Certs for the panel and (if split) sub domain
-    # come from certbot and mount into the container; the direct domain is
-    # NOT served here and its cert is not obtained on this box.
     if [ "$PANEL_AUTH_MODE" = "portal" ]; then
         cat > /opt/remnawave/Caddyfile <<EOL
 {
@@ -416,11 +390,11 @@ EOL
 https://{\$PANEL_DOMAIN} {
     encode
 
-    # Subscription: public by design, no portal auth.
     route /sub/* {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 
@@ -428,11 +402,13 @@ https://{\$PANEL_DOMAIN} {
         reverse_proxy {\$BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
     route /oauth2/* {
         reverse_proxy {\$BACKEND_URL} {
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 
@@ -449,6 +425,7 @@ https://{\$PANEL_DOMAIN} {
         reverse_proxy {\$BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 }
@@ -462,11 +439,11 @@ EOL
 https://{\$PANEL_DOMAIN} {
     encode
 
-    # Subscription: public, no cookie required.
     route /sub/* {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 
@@ -493,12 +470,14 @@ https://{\$PANEL_DOMAIN} {
     handle @oauth2_callback {
         reverse_proxy {\$BACKEND_URL} {
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 
     reverse_proxy {\$BACKEND_URL} {
         header_up X-Real-IP {remote}
         header_up Host {host}
+        header_up X-Forwarded-Proto https
     }
 }
 EOL
@@ -513,6 +492,7 @@ https://{\$SUB_DOMAIN} {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 }
@@ -543,9 +523,6 @@ installation_panel_caddy() {
         SUB_CERT_DOMAIN=$(resolve_certificate_domain "$SUB_DOMAIN") || return 1
     fi
 
-    # Certbot deploy hook restarts remnawave-caddy: the container reads its
-    # certs from the bind-mounted /etc/letsencrypt tree and keeps serving
-    # the old inode until restarted.
     for domain in "${!domains_to_check[@]}"; do
         local lineage conf
         lineage=$(resolve_certificate_domain "$domain" 2>/dev/null) || continue
@@ -585,9 +562,7 @@ installation_panel_caddy() {
         *) abort_with_credentials "${LANG[ERROR_REGISTER]}: $token" ;;
     esac
 
-    # No config profile on panel-only: no local node to bind. The
-    # subscription page token still gets created for the sub-page container.
-    persist_script_api_token "$domain_url" "$token"
+    persist_script_api_token "$token"
     create_api_token "$domain_url" "$token" "$target_dir"
 
     if [ -n "$CP_ECH_PUBLIC_CONFIG" ]; then
