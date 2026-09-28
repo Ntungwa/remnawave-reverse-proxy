@@ -1,18 +1,23 @@
 #!/bin/bash
 # Module: Remnawave API Functions
 #
-# ECH: server key blob passed INLINE as base64 (echServerKeys is decoded by
-# base64.StdEncoding). The file on disk is a reference copy.
+# Design A: Xray owns 443 and holds every certificate plus the static ECH
+# key. The webserver (nginx or caddy) is a cleartext reverse proxy on a
+# unix socket behind Xray.
 #
-# All inbounds carry a unique tag derived from the primary tag — Remnawave
-# rejects tagless inbounds (A112), and ConfigProfileInbounds enforces a
-# global unique constraint on tag.
+# ECH: the server-key base64 blob is passed INLINE as echServerKeys — Xray
+# decodes that field with base64.StdEncoding and a file path is not base64.
+# The file on disk is a reference copy.
 #
-# Fallback hosts: one visible host for the primary inbound, one hidden host
-# per fallback inbound, all sharing the primary tag. The subscription
-# template injects the hidden ones via `remnawave.injectHosts` with the
-# `sameTagAsRecipient` selector and `useHostRemarkAsTag`, and adds the
-# visible one via `addVirtualHostAsOutbound: true`.
+# Fallback inbounds: one visible host (tag derived from CP_INBOUND_TAG)
+# plus one hidden host per fallback inbound, all sharing the same host tag.
+# The subscription template's remnawave.injectHosts directive injects the
+# hidden hosts as client outbounds.
+#
+# Host tags are normalized to /^[A-Z0-9_:]+$/ — Remnawave rejects anything
+# else. Inbound tags use lowercase + hyphens; the sanitizer upper-cases and
+# replaces the rest so the visible and hidden hosts all land on the same
+# compliant tag.
 
 err_msg() { echo -e "${COLOR_RED}$*${COLOR_RESET}" >&2; }
 
@@ -31,6 +36,10 @@ make_api_request() {
         curl -s --connect-timeout 10 --max-time 60 -X "$method" "$url" "${headers[@]}"
     fi
 }
+
+# ---------------------------------------------------------------------------
+# Token introspection and minting
+# ---------------------------------------------------------------------------
 
 rw_token_is_api() {
     local tok="$1"; [ -n "$tok" ] || return 1
@@ -61,6 +70,10 @@ persist_script_api_token() {
     chmod 600 "$file" 2>/dev/null
 }
 
+# ---------------------------------------------------------------------------
+# Panel registration, login, key retrieval
+# ---------------------------------------------------------------------------
+
 register_remnawave() {
     local domain_url=$1 username=$2 password=$3 token=$4
     local d
@@ -68,11 +81,14 @@ register_remnawave() {
     step_do "${LANG[REGISTERING_REMNAWAVE]}" >&2
     local r
     r=$(make_api_request "POST" "http://$domain_url/api/auth/register" "$token" "$d")
-    if [ -z "$r" ]; then err_msg "${LANG[ERROR_EMPTY_RESPONSE_REGISTER]}"; return 1
+    if [ -z "$r" ]; then
+        err_msg "${LANG[ERROR_EMPTY_RESPONSE_REGISTER]}"; return 1
     elif [[ "$r" == *"accessToken"* ]]; then
         step_ok "${LANG[REGISTRATION_SUCCESS]}" >&2
         echo "$r" | jq -r '.response.accessToken'; return 0
-    else err_msg "${LANG[ERROR_REGISTER]}: $r"; return 1; fi
+    else
+        err_msg "${LANG[ERROR_REGISTER]}: $r"; return 1
+    fi
 }
 
 panel_login_url() {
@@ -120,7 +136,13 @@ get_panel_token() {
         echo -e "${COLOR_YELLOW}${LANG[USING_SAVED_TOKEN]}${COLOR_RESET}"
         local tr; tr=$(make_api_request "GET" "http://${domain_url}/api/config-profiles" "$token")
         if [ -z "$tr" ] || ! echo "$tr" | jq -e '.response.configProfiles' >/dev/null 2>&1; then
-            echo -e "${COLOR_RED}${LANG[INVALID_SAVED_TOKEN]}${COLOR_RESET}"; token=""
+            if echo "$tr" | grep -q '"statusCode":401' || \
+               echo "$tr" | jq -e '.message | test("Unauthorized")' >/dev/null 2>&1; then
+                echo -e "${COLOR_RED}${LANG[INVALID_SAVED_TOKEN]}${COLOR_RESET}"
+            else
+                echo -e "${COLOR_RED}${LANG[INVALID_SAVED_TOKEN]}: $tr${COLOR_RESET}"
+            fi
+            token=""
         fi
     fi
     if [ -z "$token" ]; then
@@ -130,6 +152,10 @@ get_panel_token() {
             printf "${COLOR_YELLOW}${LANG[CREATE_API_TOKEN_INSTRUCTION]}${COLOR_RESET}\n" "$(panel_login_url)"
             reading "${LANG[ENTER_API_TOKEN]}" token
             [ -n "$token" ] || { echo -e "${COLOR_RED}${LANG[EMPTY_TOKEN_ERROR]}${COLOR_RESET}"; return 1; }
+            local tr2; tr2=$(make_api_request "GET" "http://${domain_url}/api/config-profiles" "$token")
+            if [ -z "$tr2" ] || ! echo "$tr2" | jq -e '.response.configProfiles' >/dev/null 2>&1; then
+                echo -e "${COLOR_RED}${LANG[INVALID_SAVED_TOKEN]}: $tr2${COLOR_RESET}"; return 1
+            fi
         else
             reading "${LANG[ENTER_PANEL_USERNAME]}" username
             reading "${LANG[ENTER_PANEL_PASSWORD]}" password
@@ -167,6 +193,11 @@ get_public_key() {
     if [ -z "$pk" ] || [ "$pk" = "null" ]; then
         echo -e "${COLOR_RED}${LANG[ERROR_EXTRACT_PUBLIC_KEY]}: $r${COLOR_RESET}"; return 1
     fi
+
+    # The secretKey is itself a JSON document. sed-ing it into a
+    # double-quoted YAML scalar produces SECRET_KEY="{"..."}" which
+    # docker compose cannot parse. Single-quoted YAML keeps inner double
+    # quotes literal; any single quote is doubled.
     local compose="$target_dir/docker-compose.yml"
     if command -v python3 >/dev/null 2>&1; then
         python3 - "$compose" "$pk" <<'PY'
@@ -186,6 +217,7 @@ PY
     step_ok "${LANG[PUBLIC_KEY_SUCCESS]}"
 }
 
+# Kept for backward compatibility with callers that still expect it.
 generate_xray_keys() {
     local domain_url=$1 token=$2
     step_do "${LANG[GENERATE_KEYS]}" >&2
@@ -197,13 +229,28 @@ generate_xray_keys() {
     fi
     local pk
     pk=$(echo "$r" | jq -r '.response.keypairs[0].privateKey')
-    if [ -z "$pk" ] || [ "$pk" = "null" ]; then err_msg "${LANG[ERROR_EXTRACT_PRIVATE_KEY]}"; return 1; fi
+    if [ -z "$pk" ] || [ "$pk" = "null" ]; then
+        err_msg "${LANG[ERROR_EXTRACT_PRIVATE_KEY]}"; return 1
+    fi
     step_ok "${LANG[GENERATE_KEYS_SUCCESS]}" >&2
     echo "$pk"; return 0
 }
 
 # ---------------------------------------------------------------------------
 # Static ECH key management
+#
+# `xray tls ech --serverName <name>` on Xray 26.x prints:
+#     ECH config list:
+#     AGP+DQBfAAAgAC...
+#     ECH server keys:
+#     ACBFJMM4dfJ...
+#
+# echServerKeys is a base64 string fed to base64.StdEncoding.DecodeString —
+# it must be the SECOND blob inline. Passing a file path makes Xray try to
+# decode the path and fail with "invalid ECH Config<path>".
+#
+# Sets: CP_ECH_KEY_PATH (reference), CP_ECH_SERVER_KEYS_B64 (base64,
+# consumed by the profile), CP_ECH_PUBLIC_CONFIG (ECHConfigList).
 # ---------------------------------------------------------------------------
 ensure_ech_server_keys() {
     local target_dir="$1" selfsteal_domain="$2"
@@ -239,6 +286,7 @@ ensure_ech_server_keys() {
         remnawave/node:latest tls ech --serverName "$selfsteal_domain" 2>/dev/null)
     [ -z "$raw" ] && { echo -e "${COLOR_YELLOW}${LANG[ECH_KEYGEN_FAIL]}${COLOR_RESET}"; return 1; }
 
+    # Server key blob — everything after "ECH server keys:", stripped.
     local kb
     kb=$(printf '%s\n' "$raw" | sed -n '/ECH server keys:/,$p' | tail -n +2 | tr -d '[:space:]:')
     [ -z "$kb" ] && kb=$(printf '%s\n' "$raw" | sed -n 's/.*ECH server keys:[[:space:]]*//p' | tr -d '[:space:]:')
@@ -248,6 +296,7 @@ ensure_ech_server_keys() {
     printf '%s' "$kb" > "$server_file"; chmod 640 "$server_file"
     CP_ECH_SERVER_KEYS_B64="$kb"
 
+    # Public ECHConfigList.
     local pc
     pc=$(printf '%s\n' "$raw" | sed -n '/ECH config list:/,/ECH server keys:/p' | sed '1d;$d' | tr -d '[:space:]:')
     [ -z "$pc" ] && pc=$(printf '%s\n' "$raw" | sed -n '/ECH Config:/,/ECH server keys:/p' | sed '1d;$d' | tr -d '[:space:]:')
@@ -267,7 +316,7 @@ ensure_ech_server_keys() {
 }
 
 # ---------------------------------------------------------------------------
-# Subscription template — ECH injection (outbound tlsSettings)
+# Subscription template — ECH injection (echConfigList on outbound tlsSettings)
 # ---------------------------------------------------------------------------
 ensure_ech_subscription_templates() {
     local domain_url=$1 token=$2 ech_b64="$3"
@@ -310,9 +359,9 @@ ensure_ech_subscription_templates() {
 }
 
 # ---------------------------------------------------------------------------
-# Subscription template — fallback-host injection (remnawave directive)
+# Subscription template — fallback-host injection
 #
-# Adds a `remnawave` object at the root of every XRAY_JSON template:
+# Adds at the root of every XRAY_JSON template:
 #
 #   "remnawave": {
 #     "addVirtualHostAsOutbound": true,
@@ -323,8 +372,7 @@ ensure_ech_subscription_templates() {
 #   }
 #
 # The visible host becomes outbound tag "proxy"; every hidden host sharing
-# its tag is injected as an outbound whose tag is that host's remark. The
-# client receives the full fallback set as selectable outbounds.
+# the same tag is injected as an outbound whose tag is the host's remark.
 # ---------------------------------------------------------------------------
 ensure_subscription_template_inject() {
     local domain_url=$1 token=$2
@@ -381,6 +429,7 @@ ensure_subscription_template_inject() {
 # ---------------------------------------------------------------------------
 # Node / host / squad operations
 # ---------------------------------------------------------------------------
+
 check_node_domain() {
     local domain_url="$1" token="$2" domain="$3"
     local r
@@ -442,10 +491,10 @@ delete_config_profile() {
 }
 
 # ---------------------------------------------------------------------------
-# Config profile creation — TLS on 443, all-in-one fallbacks, static ECH
+# Config profile creation
 #
-# Emits:  first line = config profile UUID.
-#         Subsequent lines = "<tag>:<inbound_uuid>" for every inbound.
+# Emits:  line 1 = config profile UUID
+#         each subsequent line = "<tag>:<inbound_uuid>"
 # ---------------------------------------------------------------------------
 create_config_profile() {
     local domain_url=$1 token=$2
@@ -555,13 +604,12 @@ create_config_profile() {
     if [ -z "$r" ] || ! echo "$r" | jq -e '.response.uuid' >/dev/null 2>&1; then
         err_msg "${LANG[ERROR_CREATE_CONFIG_PROFILE]}: $r"
         echo "$r" | grep -q 'A112' && {
-            echo -e "${COLOR_YELLOW}Panel A112 — see panel log:${COLOR_RESET}" >&2
+            echo -e "${COLOR_YELLOW}Panel A112 — reason in panel log:${COLOR_RESET}" >&2
             echo -e "${COLOR_GRAY}  docker compose logs --tail=60 remnawave | grep -i 'inbound\\|tag\\|config'${COLOR_RESET}" >&2
         }
         return 1
     fi
 
-    # Emit config uuid on line 1, then "<tag>:<uuid>" for every inbound.
     local cu
     cu=$(echo "$r" | jq -r '.response.uuid')
     if [ -z "$cu" ] || [ "$cu" = "null" ]; then
@@ -574,13 +622,29 @@ create_config_profile() {
 }
 
 # ---------------------------------------------------------------------------
-# Host creation — accepts tag + hidden flag
-#   $6 remark  $7 tag  $8 is_hidden (true/false)
+# Host creation
+#
+# Args: $1 domain_url  $2 token  $3 inbound_uuid  $4 address  $5 config_uuid
+#       $6 remark  $7 host_tag  $8 is_hidden (true/false)
+#
+# Host tags must match /^[A-Z0-9_:]+$/ — the inbound tag is sanitized
+# (uppercase, illegal chars replaced with underscore) so the visible host
+# and every fallback host share one compliant tag. The subscription
+# template's sameTagAsRecipient selector picks the hidden ones up by that
+# shared tag.
 # ---------------------------------------------------------------------------
 create_host() {
     local domain_url=$1 token=$2 iu=$3 addr=$4 cu=$5
     local remark="${6:-Steal}" host_tag="${7:-}" is_hidden="${8:-false}"
     step_do "${LANG[CREATE_HOST]}"
+
+    if [ -n "$host_tag" ]; then
+        host_tag=$(printf '%s' "$host_tag" \
+            | tr '[:lower:]' '[:upper:]' \
+            | sed 's/[^A-Z0-9_:]/_/g' \
+            | sed 's/__*/_/g' \
+            | sed 's/^_//;s/_$//')
+    fi
 
     local tags_json="[]"
     [ -n "$host_tag" ] && tags_json=$(jq -n --arg t "$host_tag" '[$t]')
@@ -663,6 +727,8 @@ create_api_token() {
         echo -e "${COLOR_RED}${LANG[ERROR_CREATE_API_TOKEN]}: $(echo "$r" | jq -r '.message // "Unknown error"')" >&2
         return 1
     fi
+    # The compose references REMNAWAVE_API_TOKEN=${api_token} — the
+    # substitution source is .env, so that is where the value must land.
     local ef="$target_dir/.env"
     if [ -f "$ef" ]; then
         if grep -q '^api_token=' "$ef"; then
@@ -673,7 +739,7 @@ create_api_token() {
         fi
         chmod 600 "$ef" 2>/dev/null
     fi
-    if grep -qE 'REMNAWAVE_API_TOKEN=[^$[:space:]]' "$target_dir/docker-compose.yml" 2>/dev/null; then
+    if grep -qE 'REMNAWAWE_API_TOKEN=[^$[:space:]]' "$target_dir/docker-compose.yml" 2>/dev/null; then
         sed -i "s|REMNAWAVE_API_TOKEN=.*|REMNAWAVE_API_TOKEN=$at|" "$target_dir/docker-compose.yml"
     fi
     sleep 1
