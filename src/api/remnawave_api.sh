@@ -25,12 +25,12 @@
 #   /sstc  → Shadowsocks TCP obfs  (loopback 4002)
 #   *      → /dev/shm/nginx.sock   (cleartext webserver behind Xray)
 #
-# Every inbound declared here carries a unique tag derived from the primary
-# inbound tag. Remnawave's ConfigProfileInbounds table has a GLOBAL unique
-# constraint on tag (@@unique([tag])), so hardcoded fallback tags would make
-# the second profile (a second node added via add_node.sh) fail with A113.
-# Deriving "Steal-vless-ws" from "Steal" keeps the whole set unique per
-# profile and globally unique across profiles.
+# Every inbound declared in create_config_profile carries a unique tag
+# derived from the primary inbound tag. Remnawave's ConfigProfileInbounds
+# table has a GLOBAL unique constraint on tag (@@unique([tag])), so
+# hardcoded fallback tags would make the second profile (a second node added
+# via add_node.sh) fail with A113. Deriving "Steal-vless-ws" from "Steal"
+# keeps the whole set unique per profile and globally unique across profiles.
 
 err_msg() {
     echo -e "${COLOR_RED}$*${COLOR_RESET}" >&2
@@ -275,7 +275,37 @@ get_public_key() {
         return 1
     fi
 
-    sed -i "s|SECRET_KEY=\"PUBLIC KEY FROM REMNAWAVE-PANEL\"|SECRET_KEY=\"$pubkey\"|g" "$target_dir/docker-compose.yml"
+    # The secretKey is itself a JSON document. sed-ing it into a
+    # double-quoted YAML scalar produces `SECRET_KEY="{"..."}"`, which
+    # docker compose cannot parse. Go through a real YAML-safe single-quoted
+    # scalar instead: single quotes around the value keep the inner double
+    # quotes literal, and any literal single quote in the JSON is doubled.
+    local compose="$target_dir/docker-compose.yml"
+    local escaped
+    escaped=$(printf '%s' "$pubkey" | sed "s/'/''/g")
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$compose" "$pubkey" <<'PY'
+import io, re, sys
+path, value = sys.argv[1], sys.argv[2]
+with io.open(path, 'r', encoding='utf-8') as f:
+    src = f.read()
+pattern = re.compile(r'^(\s*-\s*SECRET_KEY=).*$', re.MULTILINE)
+replacement = r'\1' + "'" + value.replace("'", "''") + "'"
+new, n = pattern.subn(replacement, src)
+if n == 0:
+    sys.exit("SECRET_KEY line not found in " + path)
+with io.open(path, 'w', encoding='utf-8') as f:
+    f.write(new)
+PY
+    else
+        # No python3: the sed path emits a single-quoted scalar with the
+        # same escaping rules. Same end result, less robust against exotic
+        # JSON, but the secretKey is machine-generated base64/JSON and
+        # contains no single quotes in practice.
+        sed -i "s|SECRET_KEY=.*|SECRET_KEY='${escaped}'|" "$compose"
+    fi
+
     step_ok "${LANG[PUBLIC_KEY_SUCCESS]}"
 }
 
@@ -315,14 +345,26 @@ generate_xray_keys() {
 # ---------------------------------------------------------------------------
 # Static ECH key management
 #
-# The keypair is generated exactly ONCE and persisted on the host under
-# <target_dir>/ech/. Reinstalls, container recreations and node updates all
-# reuse the same key. Rotation would invalidate every client that had the
-# previous ECHConfigList baked in.
+# `xray tls ech --serverName <name>` prints a human-readable report:
+#
+#     ECH Config:
+#     AEX+DQBB...
+#     ECH server keys:
+#     ACATwY30o/RKgD6hgeQxwrSiApLaCgU+HKh7B6SUrAHaDwBD/g0APwAAIAAgHjzK...
+#
+# Xray's echServerKeys field wants the base64 key blob VERBATIM — no labels,
+# no "ECH server keys:" prefix, no blank lines, no embedded newlines.
+# Writing the whole CLI output to the file makes Xray's base64 decoder choke
+# and the core refuses to start with:
+#     Failed to build TLS config. > infra/conf: invalid ECH Config...
+#
+# The public ECHConfigList is the other base64 blob, extracted separately and
+# injected into XRAY_JSON subscription templates. It too must be the raw
+# base64 with nothing prepended.
 #
 # Host layout (target_dir is /opt/remnawave or /opt/remnanode):
-#   ech/server-keys.txt     private material, bind-mounted into Xray
-#   ech/client-config.txt   public ECHConfigList (base64)
+#   ech/server-keys.txt     base64 key blob only, bind-mounted into Xray
+#   ech/client-config.txt   base64 ECHConfigList
 #   ech/client-config.json  public config as a small JSON object
 #
 # Sets on success:
@@ -343,7 +385,11 @@ ensure_ech_server_keys() {
     mkdir -p "$ech_dir"
     chmod 750 "$ech_dir"
 
-    if [ -s "$server_file" ]; then
+    # A previously-generated key is reused as-is. If the file is present but
+    # obviously malformed (contains whitespace or a colon, i.e. a label or a
+    # newline), it is treated as stale and regenerated — that path repairs an
+    # install broken by the old writer without a manual rm.
+    if [ -s "$server_file" ] && ! LC_ALL=C grep -qE '[^A-Za-z0-9+/=]' "$server_file"; then
         CP_ECH_KEY_PATH="/etc/xray/ech/server-keys.txt"
         [ -s "$client_file" ] && CP_ECH_PUBLIC_CONFIG=$(cat "$client_file")
         step_ok "${LANG[ECH_KEYGEN_REUSED]}"
@@ -370,18 +416,57 @@ ensure_ech_server_keys() {
         return 1
     fi
 
-    printf '%s\n' "$raw_output" > "$server_file"
+    # --- server key blob -------------------------------------------------
+    # Take whatever follows "ECH server keys:" and strip ALL whitespace and
+    # any stray label characters. What remains must be pure base64.
+    local key_b64
+    key_b64=$(printf '%s\n' "$raw_output" \
+        | sed -n '/ECH server keys:/,$p' \
+        | tail -n +2 \
+        | tr -d '[:space:]:')
+    # If the label sits on the same line as the blob (output format varies
+    # between Xray tags), fall back to stripping the label prefix in place.
+    if [ -z "$key_b64" ]; then
+        key_b64=$(printf '%s\n' "$raw_output" \
+            | sed -n 's/.*ECH server keys:[[:space:]]*//p' \
+            | tr -d '[:space:]:')
+    fi
+    # Last resort: the longest base64-looking run in the output. This is the
+    # key blob; the config blob is shorter and appears earlier.
+    if [ -z "$key_b64" ]; then
+        key_b64=$(printf '%s\n' "$raw_output" \
+            | grep -oE '[A-Za-z0-9+/=]{40,}' \
+            | sort -u | awk '{ print length, $0 }' | sort -rn | head -n1 | cut -d' ' -f2-)
+    fi
+
+    if [ -z "$key_b64" ]; then
+        echo -e "${COLOR_YELLOW}${LANG[ECH_KEYGEN_FAIL]}${COLOR_RESET}"
+        return 1
+    fi
+
+    # No trailing newline: Xray's decoder is fed the file byte-for-byte, and
+    # a newline is not part of base64.StdEncoding's alphabet.
+    printf '%s' "$key_b64" > "$server_file"
     chmod 640 "$server_file"
 
+    # --- public ECHConfigList --------------------------------------------
     local public_cfg
-    public_cfg=$(printf '%s\n' "$raw_output" | sed -n 's/^ECH Config:[[:space:]]*//p' | head -n1)
-    [ -z "$public_cfg" ] && public_cfg=$(printf '%s\n' "$raw_output" \
-        | sed -n 's/.*"config":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
-    [ -z "$public_cfg" ] && public_cfg=$(printf '%s\n' "$raw_output" \
-        | grep -oE 'AEX[0-9A-Za-z+/=_-]+' | head -n1)
+    public_cfg=$(printf '%s\n' "$raw_output" \
+        | sed -n '/ECH Config:/,/ECH server keys:/p' \
+        | sed '1d;$d' \
+        | tr -d '[:space:]:')
+    if [ -z "$public_cfg" ]; then
+        public_cfg=$(printf '%s\n' "$raw_output" \
+            | sed -n 's/.*ECH Config:[[:space:]]*//p' \
+            | tr -d '[:space:]:')
+    fi
+    if [ -z "$public_cfg" ]; then
+        public_cfg=$(printf '%s\n' "$raw_output" \
+            | grep -oE 'AEX[A-Za-z0-9+/=_-]+' | head -n1)
+    fi
 
     if [ -n "$public_cfg" ]; then
-        printf '%s\n' "$public_cfg" > "$client_file"
+        printf '%s' "$public_cfg" > "$client_file"
         chmod 644 "$client_file"
         jq -n --arg ech "$public_cfg" '{ echConfigList: $ech }' > "$client_json"
         chmod 644 "$client_json"
