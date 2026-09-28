@@ -1,18 +1,20 @@
 #!/bin/bash
 # Module: Install Panel + Node (nginx, Xray TLS + static ECH on 443)
 #
-# Design A: Xray (inside remnanode) terminates TLS on 443 for every SNI and
-# holds every certificate plus the static ECH key. nginx sits on a cleartext
-# unix socket behind Xray and holds no certificate — its server blocks are
-# HTTP only, listening on /dev/shm/nginx.sock with proxy_protocol to receive
-# the real client IP from Xray's PROXY v2 header.
+# Design A: Xray owns 443, nginx is a cleartext reverse proxy on a unix
+# socket behind it. Every proxy_pass sends X-Forwarded-Proto https — the
+# panel and subscription page both run ProxyCheckMiddleware and refuse
+# requests without it.
 #
-# Domain layout:
-#   default (bonded): 2 domains — CDN (panel + /sub) and Direct (proxy).
-#   optional split:   3 domains — panel, sub, direct.
+# ECH server key is passed INLINE (base64) to the config profile.
 #
-# The whole compose is written in one heredoc — conditional content is
-# resolved by shell variables, never patched with sed.
+# Fallback inbounds: one visible host (tag = CP_INBOUND_TAG) plus one
+# hidden host per fallback inbound, all sharing the same tag. The
+# subscription template's remnawave.injectHosts directive injects the
+# hidden hosts as outbounds for every client.
+#
+# Panel healthcheck start_period 900s — Nest+Prisma boot can exceed 30s.
+# Credential banner runs even when the final docker compose up fails.
 
 install_panel_node_nginx() {
     load_selfsteal_templates_module
@@ -27,7 +29,6 @@ install_panel_node_nginx() {
         exit 1
     fi
 
-    # Bonded default; split restores the old three-domain layout.
     local split_sub="n"
     printf ' %s' "$(question "${LANG[SUB_ON_PANEL_PATH_ASK]}")"
     read_yn split_sub || true
@@ -70,8 +71,6 @@ install_panel_node_nginx() {
         unique_domains["$SUB_BASE_DOMAIN"]=1
     fi
 
-    # nginx auth: cookie (magic query param) or TinyAuth (extra subdomain +
-    # cert, own container). The caddy portal is not available on nginx.
     PANEL_AUTH_MODE=cookie
     while true; do
         echo -e ""
@@ -90,13 +89,10 @@ install_panel_node_nginx() {
 
     SUPERADMIN_USERNAME=$(generate_user)
     SUPERADMIN_PASSWORD=$(generate_password)
-
     cookies_random1=$(generate_user)
     cookies_random2=$(generate_user)
-
     METRICS_USER=$(generate_user)
     METRICS_PASS=$(generate_user)
-
     APP_SECRET=$(openssl rand -hex 64)
 
     if [ "$PANEL_AUTH_MODE" = "tinyauth" ]; then
@@ -104,8 +100,6 @@ install_panel_node_nginx() {
         tinyauth_setup "$PANEL_BASE_DOMAIN" "$PANEL_DOMAIN" "$SUB_DOMAIN" "$SELFSTEAL_DOMAIN"
     fi
 
-    # SUB_PUBLIC_DOMAIN carries the /sub suffix when bonded. The sub-page
-    # container is given CUSTOM_SUB_PREFIX=/sub so it expects the same path.
     local sub_public_domain sub_custom_prefix
     if [ "$SUB_ON_PANEL_PATH" = true ]; then
         sub_public_domain="${PANEL_DOMAIN}/sub"
@@ -115,13 +109,13 @@ install_panel_node_nginx() {
         sub_custom_prefix=""
     fi
 
-    # ---- ECH key --------------------------------------------------------
     if ! docker image inspect remnawave/node:latest >/dev/null 2>&1; then
         step_do "${LANG[ECH_IMAGE_PULL]}"
         docker pull remnawave/node:latest >/dev/null 2>&1 || true
     fi
 
     CP_ECH_KEY_PATH=""
+    CP_ECH_SERVER_KEYS_B64=""
     CP_ECH_PUBLIC_CONFIG=""
     ensure_ech_server_keys "/opt/remnawave" "$SELFSTEAL_DOMAIN" || true
 
@@ -130,7 +124,6 @@ install_panel_node_nginx() {
         ech_mount_line="      - ./ech:/etc/xray/ech:ro"
     fi
 
-    # ---- .env -----------------------------------------------------------
     cat > .env <<EOL
 ### APP ###
 APP_PORT=3000
@@ -186,13 +179,15 @@ BANDWIDTH_USAGE_NOTIFICATIONS_THRESHOLD=[60, 80]
 NOT_CONNECTED_USERS_NOTIFICATIONS_ENABLED=false
 NOT_CONNECTED_USERS_NOTIFICATIONS_AFTER_HOURS=[6, 24, 48]
 
+### Subscription-page API token (minted after the panel is registered) ###
+api_token=
+
 ### Database ###
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
 POSTGRES_DB=postgres
 EOL
 
-    # ---- docker-compose.yml ---------------------------------------------
     cat > docker-compose.yml <<EOL
 x-common: &common
   ulimits:
@@ -252,7 +247,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 900s
     depends_on:
       remnawave-db:
         condition: service_healthy
@@ -281,8 +276,6 @@ services:
       timeout: 10s
       retries: 3
 
-  # Cleartext reverse proxy behind Xray. Listens on the shared unix socket
-  # with proxy_protocol. No certificate, no SSL directives.
   remnawave-nginx:
     image: nginx:1.30
     container_name: remnawave-nginx
@@ -311,8 +304,6 @@ services:
       remnawave:
         condition: service_healthy
 
-  # Xray owns 443 (TLS). Certificates and the static ECH key mount here,
-  # never into nginx.
   remnanode:
     image: remnawave/node:latest
     container_name: remnanode
@@ -374,27 +365,19 @@ installation() {
 
     declare -A domains_to_check
     domains_to_check["$PANEL_DOMAIN"]=1
-    if [ "$SUB_ON_PANEL_PATH" = false ]; then
-        domains_to_check["$SUB_DOMAIN"]=1
-    fi
+    [ "$SUB_ON_PANEL_PATH" = false ] && domains_to_check["$SUB_DOMAIN"]=1
     domains_to_check["$SELFSTEAL_DOMAIN"]=1
-    if [ "$PANEL_AUTH_MODE" = "tinyauth" ]; then
-        domains_to_check["$TINYAUTH_DOMAIN"]=1
-    fi
+    [ "$PANEL_AUTH_MODE" = "tinyauth" ] && domains_to_check["$TINYAUTH_DOMAIN"]=1
 
     handle_certificates domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" || return 1
 
     PANEL_CERT_DOMAIN=$(resolve_certificate_domain "$PANEL_DOMAIN") || return 1
-    if [ "$SUB_ON_PANEL_PATH" = false ]; then
-        SUB_CERT_DOMAIN=$(resolve_certificate_domain "$SUB_DOMAIN") || return 1
-    fi
+    [ "$SUB_ON_PANEL_PATH" = false ] && { SUB_CERT_DOMAIN=$(resolve_certificate_domain "$SUB_DOMAIN") || return 1; }
     NODE_CERT_DOMAIN=$(resolve_certificate_domain "$SELFSTEAL_DOMAIN") || return 1
     if [ "$PANEL_AUTH_MODE" = "tinyauth" ]; then
         TINYAUTH_CERT_DOMAIN=$(resolve_certificate_domain "$TINYAUTH_DOMAIN") || return 1
     fi
 
-    # Certbot deploy hook restarts remnanode (Xray holds the certs, no hot
-    # reload through bind mounts). nginx holds no cert.
     for domain in "${!domains_to_check[@]}"; do
         local lineage conf
         lineage=$(resolve_certificate_domain "$domain" 2>/dev/null) || continue
@@ -403,10 +386,6 @@ installation() {
         sed -i -E 's|^deploy_hook = .*|deploy_hook = /usr/bin/docker restart remnanode 2>/dev/null \|\| true|' "$conf"
     done
 
-    # ---- nginx.conf -----------------------------------------------------
-    # Cleartext socket listener, proxy_protocol to receive the real client
-    # IP from Xray. No ssl_certificate directives anywhere — Xray terminated
-    # TLS on 443.
     cat > /opt/remnawave/nginx.conf <<EOL
 server_names_hash_bucket_size 64;
 
@@ -469,7 +448,6 @@ map \$arg_${cookies_random1} \$set_cookie_header {
     default "";
 }
 
-# Panel domain — sub path served by the subscription page (no cookie).
 server {
     server_name $PANEL_DOMAIN;
     listen unix:/dev/shm/nginx.sock proxy_protocol;
@@ -499,6 +477,36 @@ server {
         return 444;
     }
 
+    location ^~ /api/ {
+        proxy_http_version 1.1;
+        proxy_pass http://remnawave;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$proxy_protocol_addr;
+        proxy_set_header X-Forwarded-For \$proxy_protocol_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port 443;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    location ^~ /oauth2/ {
+        if (\$arg_code = "") { return 444; }
+        if (\$arg_state = "") { return 444; }
+        proxy_http_version 1.1;
+        proxy_pass http://remnawave;
+        proxy_set_header Host \$host;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header X-Real-IP \$proxy_protocol_addr;
+        proxy_set_header X-Forwarded-For \$proxy_protocol_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port 443;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
     location / {
         if (\$authorized = 0) {
             return 418;
@@ -524,26 +532,6 @@ server {
         root /var/www/html;
         index index.html;
     }
-
-    # OAuth2 callbacks land on /oauth2/callback/:provider from every
-    # provider's redirect (GitHub, Yandex, Pocket ID, Telegram) without
-    # the access cookie. Only a request carrying code+state gets through.
-    location ^~ /oauth2/ {
-        if (\$arg_code = "") { return 444; }
-        if (\$arg_state = "") { return 444; }
-        proxy_http_version 1.1;
-        proxy_pass http://remnawave;
-        proxy_set_header Host \$host;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-        proxy_set_header X-Real-IP \$proxy_protocol_addr;
-        proxy_set_header X-Forwarded-For \$proxy_protocol_addr;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Port 443;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
-    }
 }
 EOL
     fi
@@ -551,7 +539,6 @@ EOL
     if [ "$SUB_ON_PANEL_PATH" = false ]; then
         cat >> /opt/remnawave/nginx.conf <<EOL
 
-# Separate-sub-domain layout: its own server block.
 server {
     server_name $SUB_DOMAIN;
     listen unix:/dev/shm/nginx.sock proxy_protocol;
@@ -584,7 +571,6 @@ EOL
 
     cat >> /opt/remnawave/nginx.conf <<EOL
 
-# Direct domain — camouflage site behind Xray.
 server {
     server_name $SELFSTEAL_DOMAIN;
     listen unix:/dev/shm/nginx.sock proxy_protocol;
@@ -603,7 +589,6 @@ server {
 }
 EOL
 
-    # ---- Start stack ----------------------------------------------------
     echo -e "${COLOR_YELLOW}${LANG[STARTING_PANEL_NODE]}${COLOR_RESET}"
     sleep 1
     cd /opt/remnawave
@@ -657,21 +642,65 @@ EOL
 
     local profile_output
     profile_output=$(create_config_profile "$domain_url" "$token") || abort_with_credentials "${LANG[ERROR_CREATE_CONFIG_PROFILE]}"
-    read -r config_profile_uuid inbound_uuid <<< "$profile_output"
 
-    create_node "$domain_url" "$token" "$config_profile_uuid" "$inbound_uuid" || abort_with_credentials "${LANG[ERROR_CREATE_NODE]}"
-    create_host "$domain_url" "$token" "$inbound_uuid" "$SELFSTEAL_DOMAIN" "$config_profile_uuid" || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}"
+    local config_profile_uuid
+    config_profile_uuid=$(echo "$profile_output" | head -n1)
+    local inbound_lines
+    inbound_lines=$(echo "$profile_output" | tail -n +2)
+    if [ -z "$config_profile_uuid" ] || [ -z "$inbound_lines" ]; then
+        abort_with_credentials "${LANG[ERROR_CREATE_CONFIG_PROFILE]}: empty profile output"
+    fi
+
+    local primary_inbound_uuid=""
+    while IFS=: read -r inb_tag inb_uuid; do
+        [ -z "$inb_uuid" ] && continue
+        [ "$inb_tag" = "$CP_INBOUND_TAG" ] || continue
+        create_host "$domain_url" "$token" "$inb_uuid" "$SELFSTEAL_DOMAIN" \
+            "$config_profile_uuid" "Steal" "$CP_INBOUND_TAG" "false" \
+            || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}"
+        primary_inbound_uuid="$inb_uuid"
+        break
+    done <<< "$inbound_lines"
+    [ -n "$primary_inbound_uuid" ] || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}: primary inbound not found"
+
+    create_node "$domain_url" "$token" "$config_profile_uuid" "$primary_inbound_uuid" \
+        || abort_with_credentials "${LANG[ERROR_CREATE_NODE]}"
+
+    while IFS=: read -r inb_tag inb_uuid; do
+        [ -z "$inb_uuid" ] && continue
+        [ "$inb_tag" = "$CP_INBOUND_TAG" ] && continue
+        local remark="$inb_tag"
+        case "$inb_tag" in
+            *-vless-ws)        remark="Steal-vless-ws" ;;
+            *-vless-hu)        remark="Steal-vless-hu" ;;
+            *-vless-xhttp)     remark="Steal-vless-xhttp" ;;
+            *-vless-tcp-obfs)  remark="Steal-vless-tcp-obfs" ;;
+            *-trojan-ws)       remark="Steal-trojan-ws" ;;
+            *-trojan-hu)       remark="Steal-trojan-hu" ;;
+            *-trojan-tcp-obfs) remark="Steal-trojan-tcp-obfs" ;;
+            *-ss-ws)           remark="Steal-ss-ws" ;;
+            *-ss-tcp-obfs)     remark="Steal-ss-tcp-obfs" ;;
+        esac
+        create_host "$domain_url" "$token" "$inb_uuid" "$SELFSTEAL_DOMAIN" \
+            "$config_profile_uuid" "$remark" "$CP_INBOUND_TAG" "true" \
+            || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}"
+    done <<< "$inbound_lines"
 
     local squad_uuid
     squad_uuid=$(get_default_squad "$domain_url" "$token")
-    update_squad "$domain_url" "$token" "$squad_uuid" "$inbound_uuid"
+    while IFS=: read -r inb_tag inb_uuid; do
+        [ -z "$inb_uuid" ] && continue
+        update_squad "$domain_url" "$token" "$squad_uuid" "$inb_uuid"
+    done <<< "$inbound_lines"
 
-    persist_script_api_token "$domain_url" "$token"
+    persist_script_api_token "$token"
     create_api_token "$domain_url" "$token" "$target_dir"
 
     if [ -n "$CP_ECH_PUBLIC_CONFIG" ]; then
         ensure_ech_subscription_templates "$domain_url" "$token" "$CP_ECH_PUBLIC_CONFIG" || true
     fi
+
+    ensure_subscription_template_inject "$domain_url" "$token" || true
 
     step_do "${LANG[STOPPING_REMNAWAVE]}"
     sleep 1
@@ -680,8 +709,7 @@ EOL
     step_do "${LANG[STARTING_PANEL_NODE]}"
     sleep 1
     if ! docker compose up -d > /dev/null 2>&1; then
-        echo -e "${COLOR_RED}$(printf "${LANG[COMPOSE_UP_FAIL]}" "/opt/remnawave" "/opt/remnawave")${COLOR_RESET}"
-        return 1
+        abort_with_credentials "$(printf "${LANG[COMPOSE_UP_FAIL]}" "/opt/remnawave" "/opt/remnawave")"
     fi
 
     clear
