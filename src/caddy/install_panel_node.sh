@@ -12,6 +12,12 @@
 #
 # The whole compose is written in one heredoc — conditional content is
 # resolved by shell variables, never patched with sed.
+#
+# Every reverse_proxy block that reaches the Remnawave backend sends
+# X-Forwarded-Proto: https. The backend's ProxyCheckMiddleware refuses
+# requests without it ("Reverse proxy and HTTPS are required"), which
+# surfaces as a 502 through Caddy. The subscription page does not enforce
+# this, but the header is sent to it too for consistency.
 
 install_panel_node_caddy() {
     load_selfsteal_templates_module
@@ -196,6 +202,9 @@ BANDWIDTH_USAGE_NOTIFICATIONS_THRESHOLD=[60, 80]
 ### Not connected users notification
 NOT_CONNECTED_USERS_NOTIFICATIONS_ENABLED=false
 NOT_CONNECTED_USERS_NOTIFICATIONS_AFTER_HOURS=[6, 24, 48]
+
+### Subscription-page API token (minted after the panel is registered) ###
+api_token=
 
 ### Database ###
 POSTGRES_USER=postgres
@@ -386,6 +395,11 @@ EOL
     # Global options: no admin API, auto_https off (Xray terminated TLS),
     # proxy_protocol on the socket listener. No certificates are referenced
     # anywhere — Caddy is a cleartext reverse proxy on the shared socket.
+    #
+    # Every reverse_proxy that reaches the panel sends
+    #   header_up X-Forwarded-Proto https
+    # so the backend's ProxyCheckMiddleware stops replying
+    # "Reverse proxy and HTTPS are required" (which surfaces as a 502).
     if [ "$PANEL_AUTH_MODE" = "portal" ]; then
         cat > /opt/remnawave/Caddyfile <<EOL
 {
@@ -482,6 +496,7 @@ http://{\$PANEL_DOMAIN} {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 
@@ -491,11 +506,13 @@ http://{\$PANEL_DOMAIN} {
         reverse_proxy {\$BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
     route /oauth2/* {
         reverse_proxy {\$BACKEND_URL} {
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 
@@ -512,6 +529,7 @@ http://{\$PANEL_DOMAIN} {
         reverse_proxy {\$BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 }
@@ -528,6 +546,7 @@ http://{\$PANEL_DOMAIN} {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 
@@ -556,12 +575,14 @@ http://{\$PANEL_DOMAIN} {
     handle @oauth2_callback {
         reverse_proxy {\$BACKEND_URL} {
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 
     reverse_proxy {\$BACKEND_URL} {
         header_up X-Real-IP {remote}
         header_up Host {host}
+        header_up X-Forwarded-Proto https
     }
 }
 EOL
@@ -578,6 +599,7 @@ http://{\$SUB_DOMAIN} {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 }
@@ -659,11 +681,6 @@ installation_panel_node_caddy() {
 
     delete_config_profile "$domain_url" "$token"
 
-    # Config profile: Xray TLS on 443 for direct + panel. ECH serverName is
-    # the direct domain. Bonded layout uses the panel cert for both panel
-    # and sub SNIs; split adds the sub cert separately (not wired here —
-    # this installer's panel+node layout is bonded by design when a sub
-    # domain is not asked for).
     CP_PROFILE_NAME="StealConfig"
     CP_INBOUND_TAG="Steal"
     CP_DIRECT_DOMAIN="$SELFSTEAL_DOMAIN"
@@ -684,7 +701,7 @@ installation_panel_node_caddy() {
     squad_uuid=$(get_default_squad "$domain_url" "$token")
     update_squad "$domain_url" "$token" "$squad_uuid" "$inbound_uuid"
 
-    persist_script_api_token "$domain_url" "$token"
+    persist_script_api_token "$token"
     create_api_token "$domain_url" "$token" "$target_dir"
 
     if [ -n "$CP_ECH_PUBLIC_CONFIG" ]; then
