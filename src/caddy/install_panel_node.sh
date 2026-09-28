@@ -18,6 +18,11 @@
 # requests without it ("Reverse proxy and HTTPS are required"), which
 # surfaces as a 502 through Caddy. The subscription page does not enforce
 # this, but the header is sent to it too for consistency.
+#
+# The panel's healthcheck uses start_period: 900s. Nest+Prisma boot on this
+# layout can exceed the old 30s+3×30s window on slow disks, and a failing
+# healthcheck blocks caddy and the subscription page via depends_on —
+# making an otherwise-fine install look dead.
 
 install_panel_node_caddy() {
     load_selfsteal_templates_module
@@ -32,9 +37,6 @@ install_panel_node_caddy() {
         exit 1
     fi
 
-    # Bonded is the default: the sub page lives on the CDN domain at /sub.
-    # Split restores the old three-domain layout and asks for a separate
-    # subscription hostname.
     local split_sub="n"
     printf ' %s' "$(question "${LANG[SUB_ON_PANEL_PATH_ASK]}")"
     read_yn split_sub || true
@@ -118,8 +120,6 @@ install_panel_node_caddy() {
             "$AUTHP_ADMIN_USER" "$AUTHP_ADMIN_EMAIL" "$AUTHP_ADMIN_SECRET")
     fi
 
-    # SUB_PUBLIC_DOMAIN carries the /sub suffix when bonded. The sub-page
-    # container is given CUSTOM_SUB_PREFIX=/sub so it expects the same path.
     local sub_public_domain sub_custom_prefix
     if [ "$SUB_ON_PANEL_PATH" = true ]; then
         sub_public_domain="${PANEL_DOMAIN}/sub"
@@ -129,16 +129,13 @@ install_panel_node_caddy() {
         sub_custom_prefix=""
     fi
 
-    # ---- ECH key --------------------------------------------------------
-    # Generated before the compose is written so the remnanode volume list
-    # can carry (or omit) the mount at heredoc time. Requires the node
-    # image on disk for `xray tls ech`; pulled once here.
     if ! docker image inspect remnawave/node:latest >/dev/null 2>&1; then
         step_do "${LANG[ECH_IMAGE_PULL]}"
         docker pull remnawave/node:latest >/dev/null 2>&1 || true
     fi
 
     CP_ECH_KEY_PATH=""
+    CP_ECH_SERVER_KEYS_B64=""
     CP_ECH_PUBLIC_CONFIG=""
     ensure_ech_server_keys "/opt/remnawave" "$SELFSTEAL_DOMAIN" || true
 
@@ -147,7 +144,6 @@ install_panel_node_caddy() {
         ech_mount_line="      - ./ech:/etc/xray/ech:ro"
     fi
 
-    # ---- .env -----------------------------------------------------------
     cat > .env <<EOL
 ### APP ###
 APP_PORT=3000
@@ -212,7 +208,6 @@ POSTGRES_PASSWORD=postgres
 POSTGRES_DB=postgres
 EOL
 
-    # ---- docker-compose.yml ---------------------------------------------
     cat > docker-compose.yml <<EOL
 x-common: &common
   ulimits:
@@ -272,7 +267,10 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      # Nest+Prisma boot occasionally exceeds the old 30s+3×30s window on
+      # small disks; a shorter value blocked caddy and the subscription page
+      # via depends_on while the backend was still coming up.
+      start_period: 900s
     depends_on:
       remnawave-db:
         condition: service_healthy
@@ -301,7 +299,6 @@ services:
       timeout: 10s
       retries: 3
 
-  # Cleartext reverse proxy behind Xray. No certificate, no auto_https.
   remnawave-caddy:
       image: ${CADDY_IMAGE}
       container_name: remnawave-caddy
@@ -345,8 +342,6 @@ services:
       remnawave:
         condition: service_healthy
 
-  # Xray owns 443 (TLS). Certificates and the static ECH key mount here,
-  # never into caddy.
   remnanode:
     image: remnawave/node:latest
     container_name: remnanode
@@ -392,14 +387,6 @@ volumes:
 EOL
 
     # ---- Caddyfile ------------------------------------------------------
-    # Global options: no admin API, auto_https off (Xray terminated TLS),
-    # proxy_protocol on the socket listener. No certificates are referenced
-    # anywhere — Caddy is a cleartext reverse proxy on the shared socket.
-    #
-    # Every reverse_proxy that reaches the panel sends
-    #   header_up X-Forwarded-Proto https
-    # so the backend's ProxyCheckMiddleware stops replying
-    # "Reverse proxy and HTTPS are required" (which surfaces as a 502).
     if [ "$PANEL_AUTH_MODE" = "portal" ]; then
         cat > /opt/remnawave/Caddyfile <<EOL
 {
@@ -491,7 +478,6 @@ http://{\$PANEL_DOMAIN} {
     bind unix/{\$CADDY_SOCKET_PATH}
     encode
 
-    # Subscription: public by design, no portal auth.
     route /sub/* {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
@@ -500,8 +486,6 @@ http://{\$PANEL_DOMAIN} {
         }
     }
 
-    # Panel API carries its own Bearer-token auth; OAuth2 callbacks must
-    # reach the backend untouched.
     route /api/* {
         reverse_proxy {\$BACKEND_URL} {
             header_up X-Real-IP {remote}
@@ -541,7 +525,6 @@ http://{\$PANEL_DOMAIN} {
     bind unix/{\$CADDY_SOCKET_PATH}
     encode
 
-    # Subscription: public, no cookie required.
     route /sub/* {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
@@ -588,7 +571,6 @@ http://{\$PANEL_DOMAIN} {
 EOL
     fi
 
-    # Separate-sub-domain layout gets its own site block.
     if [ "$SUB_ON_PANEL_PATH" = false ]; then
         cat >> /opt/remnawave/Caddyfile <<EOL
 
@@ -633,8 +615,6 @@ installation_panel_node_caddy() {
     fi
     NODE_CERT_DOMAIN=$(resolve_certificate_domain "$SELFSTEAL_DOMAIN") || return 1
 
-    # Certbot deploy hook must restart remnanode: Xray holds the certs and
-    # keeps serving the old inode through its bind mounts until restarted.
     for domain in "${!domains_to_check[@]}"; do
         local lineage conf
         lineage=$(resolve_certificate_domain "$domain" 2>/dev/null) || continue
@@ -714,9 +694,11 @@ installation_panel_node_caddy() {
 
     step_do "${LANG[STARTING_PANEL_NODE]}"
     sleep 1
+    # A failed final `up` used to `return 1` before the credential banner ran,
+    # losing the admin password forever. abort_with_credentials prints the
+    # banner before exiting, so the operator always gets the credentials.
     if ! docker compose up -d > /dev/null 2>&1; then
-        echo -e "${COLOR_RED}$(printf "${LANG[COMPOSE_UP_FAIL]}" "/opt/remnawave" "/opt/remnawave")${COLOR_RESET}"
-        return 1
+        abort_with_credentials "$(printf "${LANG[COMPOSE_UP_FAIL]}" "/opt/remnawave" "/opt/remnawave")"
     fi
 
     clear
