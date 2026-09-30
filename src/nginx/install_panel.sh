@@ -1,31 +1,19 @@
 #!/bin/bash
 # Module: Install Panel Only (nginx)
 #
-# No Xray on this box, so nginx terminates TLS on 443 with its own
-# certificates. This is the one nginx installer under Design A where nginx
-# holds the certs. The direct domain is asked for anyway: it is the ECH
-# serverName that the panel will hand downstream to every node it manages,
-# and `xray tls ech` binds to it without needing the domain's cert here.
+# No Xray on this box — nginx terminates TLS on 443 with certbot certs.
+# Direct domain is asked for to bind the ECH keypair (used by remote nodes).
 #
-# Domain layout:
-#   default (bonded): 2 domains — CDN (panel + /sub) and Direct.
-#   optional split:   3 domains — panel, sub, direct.
-#
-# The whole compose and nginx.conf are written in one heredoc each —
-# conditional content is resolved by shell variables, never patched with sed.
+# Every proxy_pass sends X-Forwarded-Proto https. Panel healthcheck
+# start_period 900s. Credential banner runs even when the final up fails.
 
 install_panel_nginx() {
     mkdir -p /opt/remnawave && cd /opt/remnawave
 
     reading "${LANG[ENTER_PANEL_DOMAIN]}" PANEL_DOMAIN
     check_domain "$PANEL_DOMAIN" true true
-    local panel_check_result=$?
-    if [ $panel_check_result -eq 2 ]; then
-        echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
-        exit 1
-    fi
+    [ $? -eq 2 ] && { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
 
-    # Bonded default; split restores the old three-domain layout.
     local split_sub="n"
     printf ' %s' "$(question "${LANG[SUB_ON_PANEL_PATH_ASK]}")"
     read_yn split_sub || true
@@ -35,50 +23,32 @@ install_panel_nginx() {
         SUB_ON_PANEL_PATH=false
         reading "${LANG[ENTER_SUB_DOMAIN]}" SUB_DOMAIN
         check_domain "$SUB_DOMAIN" true true
-        local sub_check_result=$?
-        if [ $sub_check_result -eq 2 ]; then
-            echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
-            exit 1
-        fi
+        [ $? -eq 2 ] && { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
     else
         SUB_ON_PANEL_PATH=true
         SUB_DOMAIN="$PANEL_DOMAIN"
     fi
 
-    # The direct domain is asked here even though nothing on this box serves
-    # it: the ECH keypair binds to this hostname, and downstream nodes will
-    # present it as their SNI later.
     reading "${LANG[ENTER_NODE_DOMAIN]}" SELFSTEAL_DOMAIN
     if ! [[ "$SELFSTEAL_DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; then
-        echo -e "${COLOR_RED}${LANG[CERT_MANUAL_BAD_DOMAIN]}${COLOR_RESET}"
-        exit 1
+        echo -e "${COLOR_RED}${LANG[CERT_MANUAL_BAD_DOMAIN]}${COLOR_RESET}"; exit 1
     fi
-
     if [ "$PANEL_DOMAIN" = "$SELFSTEAL_DOMAIN" ] || [ "$SUB_DOMAIN" = "$SELFSTEAL_DOMAIN" ]; then
-        echo -e "${COLOR_RED}${LANG[DOMAINS_MUST_BE_UNIQUE]}${COLOR_RESET}"
-        exit 1
+        echo -e "${COLOR_RED}${LANG[DOMAINS_MUST_BE_UNIQUE]}${COLOR_RESET}"; exit 1
     fi
 
     PANEL_BASE_DOMAIN=$(extract_domain "$PANEL_DOMAIN")
-
     unique_domains["$PANEL_BASE_DOMAIN"]=1
-    if [ "$SUB_ON_PANEL_PATH" = false ]; then
-        SUB_BASE_DOMAIN=$(extract_domain "$SUB_DOMAIN")
-        unique_domains["$SUB_BASE_DOMAIN"]=1
-    fi
+    [ "$SUB_ON_PANEL_PATH" = false ] && unique_domains["$(extract_domain "$SUB_DOMAIN")"]=1
 
-    # nginx auth: cookie (magic query param) or TinyAuth (extra subdomain +
-    # cert, own container).
     PANEL_AUTH_MODE=cookie
     while true; do
-        echo -e ""
-        echo -e "${COLOR_GREEN}${LANG[PANEL_AUTH_PROMPT]}${COLOR_RESET}"
-        echo -e ""
+        echo -e ""; echo -e "${COLOR_GREEN}${LANG[PANEL_AUTH_PROMPT]}${COLOR_RESET}"; echo -e ""
         echo -e "${COLOR_YELLOW}1. ${LANG[PANEL_AUTH_OPT_COOKIE]}${COLOR_RESET}"
         echo -e "${COLOR_YELLOW}2. ${LANG[PANEL_AUTH_OPT_TINYAUTH]}${COLOR_RESET}"
         echo -e ""
-        reading "${LANG[PANEL_AUTH_PROMPT_CHOOSE]}" auth_choice
-        case "$auth_choice" in
+        reading "${LANG[PANEL_AUTH_PROMPT_CHOOSE]}" ac
+        case "$ac" in
             1) break ;;
             2) PANEL_AUTH_MODE=tinyauth; break ;;
             *) echo -e "${COLOR_RED}${LANG[CERT_INVALID_CHOICE]}${COLOR_RESET}" ;;
@@ -87,13 +57,10 @@ install_panel_nginx() {
 
     SUPERADMIN_USERNAME=$(generate_user)
     SUPERADMIN_PASSWORD=$(generate_password)
-
     cookies_random1=$(generate_user)
     cookies_random2=$(generate_user)
-
     METRICS_USER=$(generate_user)
     METRICS_PASS=$(generate_user)
-
     APP_SECRET=$(openssl rand -hex 64)
 
     if [ "$PANEL_AUTH_MODE" = "tinyauth" ]; then
@@ -101,32 +68,21 @@ install_panel_nginx() {
         tinyauth_setup "$PANEL_BASE_DOMAIN" "$PANEL_DOMAIN" "$SUB_DOMAIN"
     fi
 
-    # SUB_PUBLIC_DOMAIN carries the /sub suffix when bonded. The sub-page
-    # container is given CUSTOM_SUB_PREFIX=/sub so it expects the same path.
     local sub_public_domain sub_custom_prefix
     if [ "$SUB_ON_PANEL_PATH" = true ]; then
-        sub_public_domain="${PANEL_DOMAIN}/sub"
-        sub_custom_prefix="/sub"
+        sub_public_domain="${PANEL_DOMAIN}/sub"; sub_custom_prefix="/sub"
     else
-        sub_public_domain="$SUB_DOMAIN"
-        sub_custom_prefix=""
+        sub_public_domain="$SUB_DOMAIN"; sub_custom_prefix=""
     fi
 
-    # ---- ECH key --------------------------------------------------------
-    # Generated before the compose is written. On panel-only there is no
-    # local Xray to serve it — the key is what the panel injects into every
-    # XRAY_JSON subscription template for its remote nodes. Requires the
-    # node image on disk; pulled once here.
     if ! docker image inspect remnawave/node:latest >/dev/null 2>&1; then
         step_do "${LANG[ECH_IMAGE_PULL]}"
         docker pull remnawave/node:latest >/dev/null 2>&1 || true
     fi
 
-    CP_ECH_KEY_PATH=""
-    CP_ECH_PUBLIC_CONFIG=""
+    CP_ECH_KEY_PATH=""; CP_ECH_SERVER_KEYS_B64=""; CP_ECH_PUBLIC_CONFIG=""
     ensure_ech_server_keys "/opt/remnawave" "$SELFSTEAL_DOMAIN" || true
 
-    # ---- .env -----------------------------------------------------------
     cat > .env <<EOL
 ### APP ###
 APP_PORT=3000
@@ -182,13 +138,15 @@ BANDWIDTH_USAGE_NOTIFICATIONS_THRESHOLD=[60, 80]
 NOT_CONNECTED_USERS_NOTIFICATIONS_ENABLED=false
 NOT_CONNECTED_USERS_NOTIFICATIONS_AFTER_HOURS=[6, 24, 48]
 
+### Subscription-page API token (minted after the panel is registered) ###
+api_token=
+
 ### Database ###
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
 POSTGRES_DB=postgres
 EOL
 
-    # ---- docker-compose.yml ---------------------------------------------
     cat > docker-compose.yml <<EOL
 x-common: &common
   ulimits:
@@ -248,7 +206,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 900s
     depends_on:
       remnawave-db:
         condition: service_healthy
@@ -277,9 +235,6 @@ services:
       timeout: 10s
       retries: 3
 
-  # No Xray on this box: nginx owns 443 and terminates TLS itself with the
-  # panel and sub certificates. This is the one nginx installer where nginx
-  # holds the certs.
   remnawave-nginx:
     image: nginx:1.30
     container_name: remnawave-nginx
@@ -290,9 +245,6 @@ services:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
       - /var/www/html:/var/www/html:ro
-EOL
-
-    cat >> docker-compose.yml <<EOL
 
   remnawave-subscription-page:
     image: remnawave/subscription-page:latest
@@ -347,26 +299,17 @@ installation_panel() {
 
     declare -A domains_to_check
     domains_to_check["$PANEL_DOMAIN"]=1
-    if [ "$SUB_ON_PANEL_PATH" = false ]; then
-        domains_to_check["$SUB_DOMAIN"]=1
-    fi
-    if [ "$PANEL_AUTH_MODE" = "tinyauth" ]; then
-        domains_to_check["$TINYAUTH_DOMAIN"]=1
-    fi
+    [ "$SUB_ON_PANEL_PATH" = false ] && domains_to_check["$SUB_DOMAIN"]=1
+    [ "$PANEL_AUTH_MODE" = "tinyauth" ] && domains_to_check["$TINYAUTH_DOMAIN"]=1
 
     handle_certificates domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" "/opt/remnawave" || return 1
 
     PANEL_CERT_DOMAIN=$(resolve_certificate_domain "$PANEL_DOMAIN") || return 1
-    if [ "$SUB_ON_PANEL_PATH" = false ]; then
-        SUB_CERT_DOMAIN=$(resolve_certificate_domain "$SUB_DOMAIN") || return 1
-    fi
+    [ "$SUB_ON_PANEL_PATH" = false ] && { SUB_CERT_DOMAIN=$(resolve_certificate_domain "$SUB_DOMAIN") || return 1; }
     if [ "$PANEL_AUTH_MODE" = "tinyauth" ]; then
         TINYAUTH_CERT_DOMAIN=$(resolve_certificate_domain "$TINYAUTH_DOMAIN") || return 1
     fi
 
-    # Certbot deploy hook restarts remnawave-nginx: the container reads its
-    # certs from the bind-mounted /etc/letsencrypt tree and keeps serving
-    # the old inode until restarted.
     for domain in "${!domains_to_check[@]}"; do
         local lineage conf
         lineage=$(resolve_certificate_domain "$domain" 2>/dev/null) || continue
@@ -375,16 +318,9 @@ installation_panel() {
         sed -i -E 's|^deploy_hook = .*|deploy_hook = /usr/bin/docker restart remnawave-nginx 2>/dev/null \|\| true|' "$conf"
     done
 
-    # ---- nginx.conf -----------------------------------------------------
-    # nginx terminates TLS on 443. Certificates come from the bind-mounted
-    # certbot tree. No proxy_protocol on the listener — nginx reads the
-    # client IP directly from the TCP socket.
     cat > /opt/remnawave/nginx.conf <<EOL
 server_names_hash_bucket_size 64;
 
-# Gzip Compression
-# Remnawave 3.x does not compress response bodies itself, so the reverse proxy
-# has to. https://f.docs.rw/t/topic/354/3
 gzip_vary on;
 gzip_proxied any;
 gzip_comp_level 6;
@@ -405,13 +341,8 @@ gzip_types
     text/plain
     text/xml;
 
-upstream remnawave {
-    server 127.0.0.1:3000;
-}
-
-upstream json {
-    server 127.0.0.1:3010;
-}
+upstream remnawave { server 127.0.0.1:3000; }
+upstream json { server 127.0.0.1:3010; }
 
 map \$http_upgrade \$connection_upgrade {
     default upgrade;
@@ -435,23 +366,19 @@ map \$http_cookie \$auth_cookie {
     default 0;
     "~*${cookies_random1}=${cookies_random2}" 1;
 }
-
 map \$arg_${cookies_random1} \$auth_query {
     default 0;
     "${cookies_random2}" 1;
 }
-
 map "\$auth_cookie\$auth_query" \$authorized {
     "~1" 1;
     default 0;
 }
-
 map \$arg_${cookies_random1} \$set_cookie_header {
     "${cookies_random2}" "${cookies_random1}=${cookies_random2}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=31536000";
     default "";
 }
 
-# Panel domain — sub path served by the subscription page (no cookie).
 server {
     server_name $PANEL_DOMAIN;
     listen 443 ssl;
@@ -472,7 +399,7 @@ server {
         proxy_set_header Connection \$connection_upgrade;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host \$host;
         proxy_set_header X-Forwarded-Port \$server_port;
         proxy_send_timeout 60s;
@@ -480,30 +407,19 @@ server {
         proxy_intercept_errors on;
         error_page 400 404 500 502 @redirect;
     }
+    location @redirect { return 444; }
 
-    location @redirect {
-        return 444;
-    }
-
-    location / {
-        if (\$authorized = 0) {
-            return 444;
-        }
+    location ^~ /api/ {
         proxy_http_version 1.1;
         proxy_pass http://remnawave;
         proxy_set_header Host \$host;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host \$host;
         proxy_set_header X-Forwarded-Port \$server_port;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
     }
 
-    # OAuth2 callbacks: only a request carrying code+state gets through.
     location ^~ /oauth2/ {
         if (\$arg_code = "") { return 444; }
         if (\$arg_state = "") { return 444; }
@@ -514,7 +430,21 @@ server {
         proxy_set_header Connection \$connection_upgrade;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port \$server_port;
+    }
+
+    location / {
+        if (\$authorized = 0) { return 444; }
+        proxy_http_version 1.1;
+        proxy_pass http://remnawave;
+        proxy_set_header Host \$host;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host \$host;
         proxy_set_header X-Forwarded-Port \$server_port;
         proxy_send_timeout 60s;
@@ -527,7 +457,6 @@ EOL
     if [ "$SUB_ON_PANEL_PATH" = false ]; then
         cat >> /opt/remnawave/nginx.conf <<EOL
 
-# Separate-sub-domain layout: its own server block.
 server {
     server_name $SUB_DOMAIN;
     listen 443 ssl;
@@ -546,7 +475,7 @@ server {
         proxy_set_header Connection \$connection_upgrade;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host \$host;
         proxy_set_header X-Forwarded-Port \$server_port;
         proxy_send_timeout 60s;
@@ -554,10 +483,7 @@ server {
         proxy_intercept_errors on;
         error_page 400 404 500 502 @redirect;
     }
-
-    location @redirect {
-        return 444;
-    }
+    location @redirect { return 444; }
 }
 EOL
     fi
@@ -579,7 +505,6 @@ EOL
 
     local domain_url="127.0.0.1:3000"
     local target_dir="/opt/remnawave"
-
     sleep 20
 
     step_do "${LANG[CHECK_CONTAINERS]}"
@@ -588,23 +513,16 @@ EOL
         --header 'X-Forwarded-For: 127.0.0.1' \
         --header 'X-Forwarded-Proto: https' > /dev/null; do
         attempts=$((attempts + 1))
-        if [ "$attempts" -ge "$max_attempts" ]; then
-            error "$(printf "${LANG[CONTAINERS_TIMEOUT]}" $max_attempts)"
-        fi
+        [ "$attempts" -ge "$max_attempts" ] && error "$(printf "${LANG[CONTAINERS_TIMEOUT]}" $max_attempts)"
         echo -e "${COLOR_RED}$(printf "${LANG[CONTAINERS_NOT_READY_ATTEMPT]}" $attempts $max_attempts)${COLOR_RESET}"
         sleep 60
     done
 
     local token
     token=$(register_remnawave "$domain_url" "$SUPERADMIN_USERNAME" "$SUPERADMIN_PASSWORD")
-    case "$token" in
-        ey*) ;;
-        *) abort_with_credentials "${LANG[ERROR_REGISTER]}: $token" ;;
-    esac
+    case "$token" in ey*) ;; *) abort_with_credentials "${LANG[ERROR_REGISTER]}: $token" ;; esac
 
-    # No config profile on panel-only: no local node to bind. The
-    # subscription page token still gets created for the sub-page container.
-    persist_script_api_token "$domain_url" "$token"
+    persist_script_api_token "$token"
     create_api_token "$domain_url" "$token" "$target_dir"
 
     if [ -n "$CP_ECH_PUBLIC_CONFIG" ]; then

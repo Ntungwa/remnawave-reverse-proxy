@@ -2,32 +2,24 @@
 # Module: Install Panel + Node (nginx, Xray TLS + static ECH on 443)
 #
 # Design A: Xray owns 443, nginx is a cleartext reverse proxy on a unix
-# socket behind it. Every proxy_pass sends X-Forwarded-Proto https — the
-# panel and subscription page both run ProxyCheckMiddleware and refuse
-# requests without it.
+# socket behind it. Every proxy_pass sends X-Forwarded-Proto https.
 #
 # ECH server key is passed INLINE (base64) to the config profile.
 #
-# Fallback inbounds: one visible host (tag = CP_INBOUND_TAG) plus one
-# hidden host per fallback inbound, all sharing the same tag. The
-# subscription template's remnawave.injectHosts directive injects the
-# hidden hosts as outbounds for every client.
+# All ten hosts are created with isHidden: false so the subscription lists
+# them as ten separate proxies. Each fallback host carries its transport
+# path. remnawave.injectHosts is NOT used.
 #
-# Panel healthcheck start_period 900s — Nest+Prisma boot can exceed 30s.
-# Credential banner runs even when the final docker compose up fails.
+# Panel healthcheck start_period 900s. Credential banner runs even when the
+# final docker compose up fails.
 
 install_panel_node_nginx() {
     load_selfsteal_templates_module
-
     mkdir -p /opt/remnawave && cd /opt/remnawave
 
     reading "${LANG[ENTER_PANEL_DOMAIN]}" PANEL_DOMAIN
     check_domain "$PANEL_DOMAIN" true true
-    local panel_check_result=$?
-    if [ $panel_check_result -eq 2 ]; then
-        echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
-        exit 1
-    fi
+    local pr=$?; [ $pr -eq 2 ] && { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
 
     local split_sub="n"
     printf ' %s' "$(question "${LANG[SUB_ON_PANEL_PATH_ASK]}")"
@@ -38,11 +30,7 @@ install_panel_node_nginx() {
         SUB_ON_PANEL_PATH=false
         reading "${LANG[ENTER_SUB_DOMAIN]}" SUB_DOMAIN
         check_domain "$SUB_DOMAIN" true true
-        local sub_check_result=$?
-        if [ $sub_check_result -eq 2 ]; then
-            echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
-            exit 1
-        fi
+        pr=$?; [ $pr -eq 2 ] && { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
     else
         SUB_ON_PANEL_PATH=true
         SUB_DOMAIN="$PANEL_DOMAIN"
@@ -50,37 +38,26 @@ install_panel_node_nginx() {
 
     reading "${LANG[ENTER_NODE_DOMAIN]}" SELFSTEAL_DOMAIN
     check_domain "$SELFSTEAL_DOMAIN" true false
-    local node_check_result=$?
-    if [ $node_check_result -eq 2 ]; then
-        echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
-        exit 1
-    fi
+    pr=$?; [ $pr -eq 2 ] && { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
 
     if [ "$PANEL_DOMAIN" = "$SELFSTEAL_DOMAIN" ] || [ "$SUB_DOMAIN" = "$SELFSTEAL_DOMAIN" ]; then
-        echo -e "${COLOR_RED}${LANG[DOMAINS_MUST_BE_UNIQUE]}${COLOR_RESET}"
-        exit 1
+        echo -e "${COLOR_RED}${LANG[DOMAINS_MUST_BE_UNIQUE]}${COLOR_RESET}"; exit 1
     fi
 
     PANEL_BASE_DOMAIN=$(extract_domain "$PANEL_DOMAIN")
     SELFSTEAL_BASE_DOMAIN=$(extract_domain "$SELFSTEAL_DOMAIN")
-
     unique_domains["$PANEL_BASE_DOMAIN"]=1
     unique_domains["$SELFSTEAL_BASE_DOMAIN"]=1
-    if [ "$SUB_ON_PANEL_PATH" = false ]; then
-        SUB_BASE_DOMAIN=$(extract_domain "$SUB_DOMAIN")
-        unique_domains["$SUB_BASE_DOMAIN"]=1
-    fi
+    [ "$SUB_ON_PANEL_PATH" = false ] && unique_domains["$(extract_domain "$SUB_DOMAIN")"]=1
 
     PANEL_AUTH_MODE=cookie
     while true; do
-        echo -e ""
-        echo -e "${COLOR_GREEN}${LANG[PANEL_AUTH_PROMPT]}${COLOR_RESET}"
-        echo -e ""
+        echo -e ""; echo -e "${COLOR_GREEN}${LANG[PANEL_AUTH_PROMPT]}${COLOR_RESET}"; echo -e ""
         echo -e "${COLOR_YELLOW}1. ${LANG[PANEL_AUTH_OPT_COOKIE]}${COLOR_RESET}"
         echo -e "${COLOR_YELLOW}2. ${LANG[PANEL_AUTH_OPT_TINYAUTH]}${COLOR_RESET}"
         echo -e ""
-        reading "${LANG[PANEL_AUTH_PROMPT_CHOOSE]}" auth_choice
-        case "$auth_choice" in
+        reading "${LANG[PANEL_AUTH_PROMPT_CHOOSE]}" ac
+        case "$ac" in
             1) break ;;
             2) PANEL_AUTH_MODE=tinyauth; break ;;
             *) echo -e "${COLOR_RED}${LANG[CERT_INVALID_CHOICE]}${COLOR_RESET}" ;;
@@ -102,11 +79,9 @@ install_panel_node_nginx() {
 
     local sub_public_domain sub_custom_prefix
     if [ "$SUB_ON_PANEL_PATH" = true ]; then
-        sub_public_domain="${PANEL_DOMAIN}/sub"
-        sub_custom_prefix="/sub"
+        sub_public_domain="${PANEL_DOMAIN}/sub"; sub_custom_prefix="/sub"
     else
-        sub_public_domain="$SUB_DOMAIN"
-        sub_custom_prefix=""
+        sub_public_domain="$SUB_DOMAIN"; sub_custom_prefix=""
     fi
 
     if ! docker image inspect remnawave/node:latest >/dev/null 2>&1; then
@@ -114,15 +89,11 @@ install_panel_node_nginx() {
         docker pull remnawave/node:latest >/dev/null 2>&1 || true
     fi
 
-    CP_ECH_KEY_PATH=""
-    CP_ECH_SERVER_KEYS_B64=""
-    CP_ECH_PUBLIC_CONFIG=""
+    CP_ECH_KEY_PATH=""; CP_ECH_SERVER_KEYS_B64=""; CP_ECH_PUBLIC_CONFIG=""
     ensure_ech_server_keys "/opt/remnawave" "$SELFSTEAL_DOMAIN" || true
 
     local ech_mount_line=""
-    if [ -n "$CP_ECH_KEY_PATH" ]; then
-        ech_mount_line="      - ./ech:/etc/xray/ech:ro"
-    fi
+    [ -n "$CP_ECH_KEY_PATH" ] && ech_mount_line="      - ./ech:/etc/xray/ech:ro"
 
     cat > .env <<EOL
 ### APP ###
@@ -432,17 +403,14 @@ map \$http_cookie \$auth_cookie {
     default 0;
     "~*${cookies_random1}=${cookies_random2}" 1;
 }
-
 map \$arg_${cookies_random1} \$auth_query {
     default 0;
     "${cookies_random2}" 1;
 }
-
 map "\$auth_cookie\$auth_query" \$authorized {
     "~1" 1;
     default 0;
 }
-
 map \$arg_${cookies_random1} \$set_cookie_header {
     "${cookies_random2}" "${cookies_random1}=${cookies_random2}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=31536000";
     default "";
@@ -453,7 +421,6 @@ server {
     listen unix:/dev/shm/nginx.sock proxy_protocol;
     http2 on;
     gzip on;
-
     add_header Set-Cookie \$set_cookie_header;
 
     location ^~ /sub/ {
@@ -472,10 +439,7 @@ server {
         proxy_intercept_errors on;
         error_page 400 404 500 502 @redirect;
     }
-
-    location @redirect {
-        return 444;
-    }
+    location @redirect { return 444; }
 
     location ^~ /api/ {
         proxy_http_version 1.1;
@@ -508,12 +472,9 @@ server {
     }
 
     location / {
-        if (\$authorized = 0) {
-            return 418;
-        }
+        if (\$authorized = 0) { return 418; }
         error_page 418 = @unauthorized;
         recursive_error_pages on;
-
         proxy_http_version 1.1;
         proxy_pass http://remnawave;
         proxy_set_header Host \$host;
@@ -527,7 +488,6 @@ server {
         proxy_send_timeout 60s;
         proxy_read_timeout 60s;
     }
-
     location @unauthorized {
         root /var/www/html;
         index index.html;
@@ -561,10 +521,7 @@ server {
         proxy_intercept_errors on;
         error_page 400 404 500 502 @redirect;
     }
-
-    location @redirect {
-        return 444;
-    }
+    location @redirect { return 444; }
 }
 EOL
     fi
@@ -575,7 +532,6 @@ server {
     server_name $SELFSTEAL_DOMAIN;
     listen unix:/dev/shm/nginx.sock proxy_protocol;
     http2 on;
-
     root /var/www/html;
     index index.html;
     add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet, noimageindex" always;
@@ -599,7 +555,6 @@ EOL
 
     local domain_url="127.0.0.1:3000"
     local target_dir="/opt/remnawave"
-
     sleep 20
 
     step_do "${LANG[CHECK_CONTAINERS]}"
@@ -608,33 +563,23 @@ EOL
         --header 'X-Forwarded-For: 127.0.0.1' \
         --header 'X-Forwarded-Proto: https' > /dev/null; do
         attempts=$((attempts + 1))
-        if [ "$attempts" -ge "$max_attempts" ]; then
-            error "$(printf "${LANG[CONTAINERS_TIMEOUT]}" $max_attempts)"
-        fi
+        [ "$attempts" -ge "$max_attempts" ] && error "$(printf "${LANG[CONTAINERS_TIMEOUT]}" $max_attempts)"
         echo -e "${COLOR_RED}$(printf "${LANG[CONTAINERS_NOT_READY_ATTEMPT]}" $attempts $max_attempts)${COLOR_RESET}"
         sleep 60
     done
 
     local token
     token=$(register_remnawave "$domain_url" "$SUPERADMIN_USERNAME" "$SUPERADMIN_PASSWORD")
-    case "$token" in
-        ey*) ;;
-        *) abort_with_credentials "${LANG[ERROR_REGISTER]}: $token" ;;
-    esac
+    case "$token" in ey*) ;; *) abort_with_credentials "${LANG[ERROR_REGISTER]}: $token" ;; esac
 
     sleep 1
     get_public_key "$domain_url" "$token" "$target_dir" || abort_with_credentials "${LANG[ERROR_EXTRACT_PUBLIC_KEY]}"
-
     delete_config_profile "$domain_url" "$token"
 
-    CP_PROFILE_NAME="StealConfig"
-    CP_INBOUND_TAG="Steal"
-    CP_DIRECT_DOMAIN="$SELFSTEAL_DOMAIN"
-    CP_DIRECT_CERT="$NODE_CERT_DOMAIN"
-    CP_PANEL_DOMAIN="$PANEL_DOMAIN"
-    CP_PANEL_CERT="$PANEL_CERT_DOMAIN"
-    CP_TINYAUTH_DOMAIN=""
-    CP_TINYAUTH_CERT=""
+    CP_PROFILE_NAME="StealConfig"; CP_INBOUND_TAG="Steal"
+    CP_DIRECT_DOMAIN="$SELFSTEAL_DOMAIN"; CP_DIRECT_CERT="$NODE_CERT_DOMAIN"
+    CP_PANEL_DOMAIN="$PANEL_DOMAIN"; CP_PANEL_CERT="$PANEL_CERT_DOMAIN"
+    CP_TINYAUTH_DOMAIN=""; CP_TINYAUTH_CERT=""
     if [ "$PANEL_AUTH_MODE" = "tinyauth" ]; then
         CP_TINYAUTH_DOMAIN="$TINYAUTH_DOMAIN"
         CP_TINYAUTH_CERT="$TINYAUTH_CERT_DOMAIN"
@@ -656,7 +601,7 @@ EOL
         [ -z "$inb_uuid" ] && continue
         [ "$inb_tag" = "$CP_INBOUND_TAG" ] || continue
         create_host "$domain_url" "$token" "$inb_uuid" "$SELFSTEAL_DOMAIN" \
-            "$config_profile_uuid" "Steal" "$CP_INBOUND_TAG" "false" \
+            "$config_profile_uuid" "Steal" "$CP_INBOUND_TAG" "false" "" \
             || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}"
         primary_inbound_uuid="$inb_uuid"
         break
@@ -669,20 +614,20 @@ EOL
     while IFS=: read -r inb_tag inb_uuid; do
         [ -z "$inb_uuid" ] && continue
         [ "$inb_tag" = "$CP_INBOUND_TAG" ] && continue
-        local remark="$inb_tag"
+        local remark="$inb_tag" hpath=""
         case "$inb_tag" in
-            *-vless-ws)        remark="Steal-vless-ws" ;;
-            *-vless-hu)        remark="Steal-vless-hu" ;;
-            *-vless-xhttp)     remark="Steal-vless-xhttp" ;;
-            *-vless-tcp-obfs)  remark="Steal-vless-tcp-obfs" ;;
-            *-trojan-ws)       remark="Steal-trojan-ws" ;;
-            *-trojan-hu)       remark="Steal-trojan-hu" ;;
-            *-trojan-tcp-obfs) remark="Steal-trojan-tcp-obfs" ;;
-            *-ss-ws)           remark="Steal-ss-ws" ;;
-            *-ss-tcp-obfs)     remark="Steal-ss-tcp-obfs" ;;
+            *-vless-ws)        remark="Steal-vless-ws";        hpath="/vlws" ;;
+            *-vless-hu)        remark="Steal-vless-hu";        hpath="/vhu"  ;;
+            *-vless-xhttp)     remark="Steal-vless-xhttp";     hpath="/vxh"  ;;
+            *-vless-tcp-obfs)  remark="Steal-vless-tcp-obfs";  hpath="/vltc" ;;
+            *-trojan-ws)       remark="Steal-trojan-ws";       hpath="/trws" ;;
+            *-trojan-hu)       remark="Steal-trojan-hu";       hpath="/thu"  ;;
+            *-trojan-tcp-obfs) remark="Steal-trojan-tcp-obfs"; hpath="/trtc" ;;
+            *-ss-ws)           remark="Steal-ss-ws";           hpath="/ssws" ;;
+            *-ss-tcp-obfs)     remark="Steal-ss-tcp-obfs";     hpath="/sstc" ;;
         esac
         create_host "$domain_url" "$token" "$inb_uuid" "$SELFSTEAL_DOMAIN" \
-            "$config_profile_uuid" "$remark" "$CP_INBOUND_TAG" "true" \
+            "$config_profile_uuid" "$remark" "$CP_INBOUND_TAG" "false" "$hpath" \
             || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}"
     done <<< "$inbound_lines"
 
@@ -699,8 +644,6 @@ EOL
     if [ -n "$CP_ECH_PUBLIC_CONFIG" ]; then
         ensure_ech_subscription_templates "$domain_url" "$token" "$CP_ECH_PUBLIC_CONFIG" || true
     fi
-
-    ensure_subscription_template_inject "$domain_url" "$token" || true
 
     step_do "${LANG[STOPPING_REMNAWAVE]}"
     sleep 1
