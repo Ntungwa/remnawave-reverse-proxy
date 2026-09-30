@@ -1,5 +1,14 @@
 #!/bin/bash
 # Module: Remnawave API Functions
+#
+# TLS ALPN is ["h2","http/1.1"]. The Xray fallback docs:
+#   - baseline: "When this item has child elements, Inbound TLS must set
+#     alpn:['http/1.1']"
+#   - h2 access: "When fallbacks alpn contains 'h2', Inbound TLS needs to
+#     set alpn:['h2','http/1.1']"
+# XHTTP is HTTP/2 and requires h2 in the ALPN. Path matching does not work
+# for h2 traffic (HPACK-encoded, VLESS peeks only plain-text HTTP/1.1), so
+# the XHTTP fallback matches by ALPN "h2", not by path.
 
 err_msg() { echo -e "${COLOR_RED}$*${COLOR_RESET}" >&2; }
 
@@ -249,14 +258,6 @@ ensure_ech_server_keys() {
     step_ok "${LANG[ECH_KEYGEN_OK]}"; return 0
 }
 
-# ---------------------------------------------------------------------------
-# ECH injection into XRAY_JSON templates.
-#
-# PATCH body is {uuid, templateJson} ONLY. Sending `name` collides with the
-# panel's reserved template names (A172); sending `templateType` is not in
-# the DTO. The uuid comes from the list endpoint, which returns the current
-# set every call — never cached across runs.
-# ---------------------------------------------------------------------------
 ensure_ech_subscription_templates() {
     local domain_url=$1 token=$2 ech_b64="$3"
     [ -z "$ech_b64" ] && { echo -e "${COLOR_YELLOW}${LANG[ECH_TEMPLATE_NO_KEY]}${COLOR_RESET}"; return 1; }
@@ -279,7 +280,7 @@ ensure_ech_subscription_templates() {
         [ -z "$tpl" ] && { failed=$((failed+1)); continue; }
         name=$(echo "$tpl" | jq -r '.response.name // empty')
         body=$(echo "$tpl" | jq -c '.response.templateJson // empty')
-        if [ -z "$body" ] || [ "$body" = "null" ]; then failed=$((failed+1)); continue; fi
+        [ -z "$body" ] || [ "$body" = "null" ] && { failed=$((failed+1)); continue; }
 
         if printf '%s' "$body" | jq -e '[.. | objects | select(has("echConfigList"))] | length > 0' >/dev/null 2>&1; then
             skipped=$((skipped+1)); continue
@@ -287,7 +288,7 @@ ensure_ech_subscription_templates() {
 
         patched=$(printf '%s' "$body" | jq -c --arg e "$ech_b64" \
             '(.. | objects | select(has("serverName") and (has("echConfigList") | not))) |= . + {echConfigList: $e}' 2>/dev/null)
-        if [ -z "$patched" ] || [ "$patched" = "$body" ]; then skipped=$((skipped+1)); continue; fi
+        [ -z "$patched" ] || [ "$patched" = "$body" ] && { skipped=$((skipped+1)); continue; }
 
         ub=$(jq -n --arg u "$uuid" --argjson b "$patched" '{uuid:$u, templateJson:$b}')
         resp=$(make_api_request "PATCH" "http://$domain_url/api/subscription-templates" "$token" "$ub")
@@ -301,9 +302,6 @@ ensure_ech_subscription_templates() {
     [ "$failed" -eq 0 ]
 }
 
-# ---------------------------------------------------------------------------
-# Fallback host injection. Same PATCH shape: {uuid, templateJson} only.
-# ---------------------------------------------------------------------------
 ensure_subscription_template_inject() {
     local domain_url=$1 token=$2
     step_do "Injecting fallback hosts into XRAY_JSON templates"
@@ -324,7 +322,7 @@ ensure_subscription_template_inject() {
         [ -z "$tpl" ] && { failed=$((failed+1)); continue; }
         name=$(echo "$tpl" | jq -r '.response.name // empty')
         body=$(echo "$tpl" | jq -c '.response.templateJson // empty')
-        if [ -z "$body" ] || [ "$body" = "null" ]; then failed=$((failed+1)); continue; fi
+        [ -z "$body" ] || [ "$body" = "null" ] && { failed=$((failed+1)); continue; }
 
         if printf '%s' "$body" | jq -e '.remnawave.injectHosts' >/dev/null 2>&1; then
             skipped=$((skipped+1)); continue
@@ -339,7 +337,7 @@ ensure_subscription_template_inject() {
                 ]
             }' 2>/dev/null)
 
-        if [ -z "$patched" ] || [ "$patched" = "$body" ]; then skipped=$((skipped+1)); continue; fi
+        [ -z "$patched" ] || [ "$patched" = "$body" ] && { skipped=$((skipped+1)); continue; }
 
         ub=$(jq -n --arg u "$uuid" --argjson b "$patched" '{uuid:$u, templateJson:$b}')
         resp=$(make_api_request "PATCH" "http://$domain_url/api/subscription-templates" "$token" "$ub")
@@ -405,240 +403,4 @@ delete_config_profile() {
     fi
     local r; r=$(make_api_request "DELETE" "http://$domain_url/api/config-profiles/$uuid" "$token")
     [ -z "$r" ] && return 0
-    echo "$r" | jq -e '.' >/dev/null 2>&1 || { echo -e "${COLOR_RED}${LANG[ERROR_DELETE_PROFILE]}${COLOR_RESET}"; return 1; }
-    return 0
-}
-
-create_config_profile() {
-    local domain_url=$1 token=$2
-    local name="$CP_PROFILE_NAME" tag="$CP_INBOUND_TAG"
-    local dd="$CP_DIRECT_DOMAIN" dc="$CP_DIRECT_CERT"
-    local pd="${CP_PANEL_DOMAIN:-}" pc="${CP_PANEL_CERT:-}"
-    local td="${CP_TINYAUTH_DOMAIN:-}" tc="${CP_TINYAUTH_CERT:-}"
-    local ech_path="${CP_ECH_KEY_PATH:-}" ech_b64="${CP_ECH_SERVER_KEYS_B64:-}"
-
-    step_do "${LANG[CREATING_CONFIG_PROFILE]}" >&2
-    if [ -z "$name" ] || [ -z "$dd" ] || [ -z "$dc" ]; then
-        err_msg "${LANG[ERROR_CREATE_CONFIG_PROFILE]}: missing CP_* globals"; return 1
-    fi
-    if [ -z "$tag" ]; then err_msg "${LANG[ERROR_CREATE_CONFIG_PROFILE]}: CP_INBOUND_TAG empty"; return 1; fi
-    case "$tag" in *,*) err_msg "${LANG[ERROR_CREATE_CONFIG_PROFILE]}: CP_INBOUND_TAG has comma"; return 1;; esac
-
-    local certs_json
-    certs_json=$(jq -n --arg dc "$dc" --arg pc "$pc" --arg tc "$tc" '
-        ([{certificateFile:("/etc/letsencrypt/live/"+$dc+"/fullchain.pem"),keyFile:("/etc/letsencrypt/live/"+$dc+"/privkey.pem"),ocspStapling:3600}]
-         + (if $pc!="" then [{certificateFile:("/etc/letsencrypt/live/"+$pc+"/fullchain.pem"),keyFile:("/etc/letsencrypt/live/"+$pc+"/privkey.pem"),ocspStapling:3600}] else [] end)
-         + (if $tc!="" then [{certificateFile:("/etc/letsencrypt/live/"+$tc+"/fullchain.pem"),keyFile:("/etc/letsencrypt/live/"+$tc+"/privkey.pem"),ocspStapling:3600}] else [] end))
-        | unique_by(.certificateFile)')
-
-    local tls_json
-    if [ -n "$ech_b64" ]; then
-        tls_json=$(jq -n --argjson c "$certs_json" --arg e "$ech_b64" '{
-            certificates:$c,minVersion:"1.2",
-            cipherSuites:"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-            alpn:["h2","http/1.1"],echServerKeys:$e}')
-    elif [ -n "$ech_path" ]; then
-        echo -e "${COLOR_YELLOW}${LANG[ECH_KEYGEN_FAIL]}: server keys b64 missing, using TLS without ECH${COLOR_RESET}" >&2
-        tls_json=$(jq -n --argjson c "$certs_json" '{certificates:$c,minVersion:"1.2",
-            cipherSuites:"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-            alpn:["h2","http/1.1"]}')
-    else
-        tls_json=$(jq -n --argjson c "$certs_json" '{certificates:$c,minVersion:"1.2",
-            cipherSuites:"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-            alpn:["h2","http/1.1"]}')
-    fi
-
-    local fbs
-    fbs=$(jq -n --arg sn "$dd" '[
-        {name:$sn,path:"/vlws",dest:"@vless-ws",xver:2},
-        {name:$sn,path:"/vhu",dest:"@vless-hu",xver:2},
-        {name:$sn,path:"/vxh",dest:"@vless-xhttp"},
-        {name:$sn,path:"/vltc",dest:"@vless-tcp-obfs",xver:2},
-        {name:$sn,path:"/trws",dest:"@trojan-ws",xver:2},
-        {name:$sn,path:"/thu",dest:"@trojan-hu",xver:2},
-        {name:$sn,path:"/trtc",dest:"@trojan-tcp-obfs",xver:2},
-        {name:$sn,path:"/ssws",dest:4001},
-        {name:$sn,path:"/sstc",dest:4002},
-        {dest:"/dev/shm/nginx.sock",xver:2}]')
-
-    local body
-    body=$(jq -n --arg name "$name" --arg tag "$tag" --argjson fbs "$fbs" --argjson tls "$tls_json" '
-    {name:$name,config:{
-        log:{loglevel:"warning"},
-        dns:{queryStrategy:"UseIPv4",servers:[{address:"https://dns.google/dns-query",skipFallback:false}]},
-        inbounds:[
-            {tag:$tag,port:443,protocol:"vless",
-             settings:{clients:[],decryption:"none",fallbacks:$fbs},
-             sniffing:{enabled:true,destOverride:["http","tls","quic"]},
-             streamSettings:{network:"tcp",security:"tls",tlsSettings:$tls}},
-            {tag:($tag+"-vless-ws"),listen:"@vless-ws",protocol:"vless",
-             settings:{clients:[],decryption:"none"},
-             streamSettings:{network:"ws",security:"none",wsSettings:{acceptProxyProtocol:true,path:"/vlws"}},
-             sniffing:{enabled:true,destOverride:["http","tls"]}},
-            {tag:($tag+"-vless-hu"),listen:"@vless-hu",protocol:"vless",
-             settings:{clients:[],decryption:"none"},
-             streamSettings:{network:"httpupgrade",security:"none",httpupgradeSettings:{acceptProxyProtocol:true,path:"/vhu"}},
-             sniffing:{enabled:true,destOverride:["http","tls"]}},
-            {tag:($tag+"-vless-xhttp"),listen:"@vless-xhttp",protocol:"vless",
-             settings:{clients:[],decryption:"none"},
-             streamSettings:{network:"xhttp",security:"none",xhttpSettings:{path:"/vxh",mode:"auto"}},
-             sniffing:{enabled:true,destOverride:["http","tls"]}},
-            {tag:($tag+"-vless-tcp-obfs"),listen:"@vless-tcp-obfs",protocol:"vless",
-             settings:{clients:[],decryption:"none"},
-             streamSettings:{network:"tcp",security:"none",tcpSettings:{acceptProxyProtocol:true,header:{type:"http",request:{path:["/vltc"]}}}},
-             sniffing:{enabled:true,destOverride:["http","tls"]}},
-            {tag:($tag+"-trojan-ws"),listen:"@trojan-ws",protocol:"trojan",
-             settings:{clients:[]},
-             streamSettings:{network:"ws",security:"none",wsSettings:{acceptProxyProtocol:true,path:"/trws"}},
-             sniffing:{enabled:true,destOverride:["http","tls"]}},
-            {tag:($tag+"-trojan-hu"),listen:"@trojan-hu",protocol:"trojan",
-             settings:{clients:[]},
-             streamSettings:{network:"httpupgrade",security:"none",httpupgradeSettings:{acceptProxyProtocol:true,path:"/thu"}},
-             sniffing:{enabled:true,destOverride:["http","tls"]}},
-            {tag:($tag+"-trojan-tcp-obfs"),listen:"@trojan-tcp-obfs",protocol:"trojan",
-             settings:{clients:[]},
-             streamSettings:{network:"tcp",security:"none",tcpSettings:{acceptProxyProtocol:true,header:{type:"http",request:{path:["/trtc"]}}}},
-             sniffing:{enabled:true,destOverride:["http","tls"]}},
-            {tag:($tag+"-ss-ws"),listen:"127.0.0.1",port:4001,protocol:"shadowsocks",
-             settings:{method:"chacha20-ietf-poly1305",clients:[]},
-             streamSettings:{network:"ws",security:"none",wsSettings:{path:"/ssws"}},
-             sniffing:{enabled:true,destOverride:["http","tls"]}},
-            {tag:($tag+"-ss-tcp-obfs"),listen:"127.0.0.1",port:4002,protocol:"shadowsocks",
-             settings:{method:"chacha20-ietf-poly1305",clients:[]},
-             streamSettings:{network:"tcp",security:"none",tcpSettings:{header:{type:"http",request:{path:["/sstc"]}}}},
-             sniffing:{enabled:true,destOverride:["http","tls"]}}
-        ],
-        outbounds:[{tag:"DIRECT",protocol:"freedom"},{tag:"BLOCK",protocol:"blackhole"}],
-        routing:{rules:[{ip:["geoip:private"],outboundTag:"BLOCK"},{protocol:["bittorrent"],outboundTag:"BLOCK"}]}
-    }}')
-
-    local r
-    r=$(make_api_request "POST" "http://$domain_url/api/config-profiles" "$token" "$body")
-    if [ -z "$r" ] || ! echo "$r" | jq -e '.response.uuid' >/dev/null 2>&1; then
-        err_msg "${LANG[ERROR_CREATE_CONFIG_PROFILE]}: $r"
-        echo "$r" | grep -q 'A112' && {
-            echo -e "${COLOR_YELLOW}Panel A112 — reason in panel log:${COLOR_RESET}" >&2
-            echo -e "${COLOR_GRAY}  docker compose logs --tail=60 remnawave | grep -i 'inbound\\|tag\\|config'${COLOR_RESET}" >&2
-        }
-        return 1
-    fi
-
-    local cu
-    cu=$(echo "$r" | jq -r '.response.uuid')
-    if [ -z "$cu" ] || [ "$cu" = "null" ]; then
-        err_msg "${LANG[ERROR_CREATE_CONFIG_PROFILE]}: missing config uuid"; return 1
-    fi
-    echo "$cu"
-    echo "$r" | jq -r '.response.inbounds[]? | select(.tag and .uuid) | "\(.tag):\(.uuid)"'
-    step_ok "${LANG[CONFIG_PROFILE_CREATED]}" >&2
-    return 0
-}
-
-create_host() {
-    local domain_url=$1 token=$2 iu=$3 addr=$4 cu=$5
-    local remark="${6:-Steal}" host_tag="${7:-}" is_hidden="${8:-false}"
-    step_do "${LANG[CREATE_HOST]}"
-
-    if [ -n "$host_tag" ]; then
-        host_tag=$(printf '%s' "$host_tag" \
-            | tr '[:lower:]' '[:upper:]' \
-            | sed 's/[^A-Z0-9_:]/_/g' \
-            | sed 's/__*/_/g' \
-            | sed 's/^_//;s/_$//')
-    fi
-
-    local tags_json="[]"
-    [ -n "$host_tag" ] && tags_json=$(jq -n --arg t "$host_tag" '[$t]')
-
-    local body
-    body=$(jq -n --arg cu "$cu" --arg iu "$iu" --arg r "$remark" --arg a "$addr" \
-                  --argjson tags "$tags_json" --argjson hid "$is_hidden" \
-        '{inbound:{configProfileUuid:$cu,configProfileInboundUuid:$iu},remark:$r,
-          address:$a,port:443,path:"",sni:$a,host:"",alpn:null,fingerprint:"firefox",
-          isDisabled:false,securityLayer:"DEFAULT",tags:$tags,isHidden:$hid}')
-
-    local r
-    r=$(make_api_request "POST" "http://$domain_url/api/hosts" "$token" "$body")
-    if echo "$r" | jq -e '.response.uuid' >/dev/null 2>&1; then step_ok "${LANG[HOST_CREATED]}"; return 0; fi
-    [ -z "$r" ] && echo -e "${COLOR_RED}${LANG[ERROR_EMPTY_RESPONSE_HOST]}${COLOR_RESET}" || echo -e "${COLOR_RED}${LANG[ERROR_CREATE_HOST]}: $r${COLOR_RESET}"
-    return 1
-}
-
-get_default_squad() {
-    local domain_url=$1 token=$2
-    step_do "${LANG[GET_DEFAULT_SQUAD]}" >&2
-    local r; r=$(make_api_request "GET" "http://$domain_url/api/internal-squads" "$token")
-    if [ -z "$r" ] || ! echo "$r" | jq -e '.response.internalSquads' >/dev/null 2>&1; then
-        err_msg "${LANG[ERROR_GET_SQUAD]}: $r"; return 1
-    fi
-    local sq; sq=$(echo "$r" | jq -r '.response.internalSquads[].uuid' 2>/dev/null)
-    [ -z "$sq" ] && { echo -e "${COLOR_YELLOW}${LANG[NO_SQUADS_FOUND]}${COLOR_RESET}" >&2; return 0; }
-    local valid=""
-    while IFS= read -r uuid; do
-        [ -z "$uuid" ] && continue
-        if [[ $uuid =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-            valid+="$uuid\n"
-        else err_msg "${LANG[INVALID_UUID_FORMAT]}: $uuid"; fi
-    done <<< "$sq"
-    [ -z "$valid" ] && { echo -e "${COLOR_YELLOW}${LANG[NO_VALID_SQUADS_FOUND]}${COLOR_RESET}" >&2; return 0; }
-    echo -e "$valid" | sed '/^$/d'; return 0
-}
-
-update_squad() {
-    local domain_url=$1 token=$2 su=$3 iu=$4
-    if [[ ! $su =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-        echo -e "${COLOR_RED}${LANG[INVALID_SQUAD_UUID]}: $su${COLOR_RESET}"; return 1
-    fi
-    if [[ ! $iu =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-        echo -e "${COLOR_RED}${LANG[INVALID_INBOUND_UUID]}: $iu${COLOR_RESET}"; return 1
-    fi
-    local sr; sr=$(make_api_request "GET" "http://$domain_url/api/internal-squads" "$token")
-    if [ -z "$sr" ] || ! echo "$sr" | jq -e '.response.internalSquads' >/dev/null 2>&1; then
-        echo -e "${COLOR_RED}${LANG[ERROR_GET_SQUAD]}: $sr${COLOR_RESET}"; return 1
-    fi
-    local ei
-    ei=$(echo "$sr" | jq -r --arg u "$su" '.response.internalSquads[] | select(.uuid==$u) | .inbounds[].uuid' 2>/dev/null)
-    if [ -z "$ei" ]; then ei="[]"; else ei=$(echo "$ei" | jq -R . | jq -s .); fi
-    local arr body r
-    arr=$(jq -n --argjson e "$ei" --arg n "$iu" '$e + [$n] | unique')
-    body=$(jq -n --arg u "$su" --argjson i "$arr" '{uuid:$u,inbounds:$i}')
-    r=$(make_api_request "PATCH" "http://$domain_url/api/internal-squads" "$token" "$body")
-    if [ -z "$r" ] || ! echo "$r" | jq -e '.response.uuid' >/dev/null 2>&1; then
-        echo -e "${COLOR_RED}${LANG[ERROR_UPDATE_SQUAD]}: $r${COLOR_RESET}"; return 1
-    fi
-    step_ok "${LANG[UPDATE_SQUAD]}"; return 0
-}
-
-create_api_token() {
-    local domain_url=$1 token=$2 target_dir=$3 token_name="${4:-subscription-page}"
-    step_do "${LANG[CREATING_API_TOKEN]}" >&2
-    local td r at
-    td='{"name":"'"$token_name"'","expiresInDays":3650,"scopes":["subscription-page-configs:list","subscription-page-configs:get","subscriptions:subpage-config","system:metadata","users:by-username"]}'
-    r=$(make_api_request "POST" "http://$domain_url/api/tokens" "$token" "$td")
-    at=$(echo "$r" | jq -r '.response.token // ""')
-    if [ -z "$at" ] || [ "$at" = "null" ]; then
-        td='{"name":"'"$token_name"'","expiresInDays":3650,"scopes":["*"]}'
-        r=$(make_api_request "POST" "http://$domain_url/api/tokens" "$token" "$td")
-        at=$(echo "$r" | jq -r '.response.token // ""')
-    fi
-    if [ -z "$at" ] || [ "$at" = "null" ]; then
-        echo -e "${COLOR_RED}${LANG[ERROR_CREATE_API_TOKEN]}: $(echo "$r" | jq -r '.message // "Unknown error"')" >&2
-        return 1
-    fi
-    local ef="$target_dir/.env"
-    if [ -f "$ef" ]; then
-        if grep -q '^api_token=' "$ef"; then
-            sed -i "s|^api_token=.*|api_token=$at|" "$ef"
-        else
-            [ -n "$(tail -c1 "$ef" 2>/dev/null)" ] && printf '\n' >> "$ef"
-            printf 'api_token=%s\n' "$at" >> "$ef"
-        fi
-        chmod 600 "$ef" 2>/dev/null
-    fi
-    if grep -qE 'REMNAWAVE_API_TOKEN=[^$[:space:]]' "$target_dir/docker-compose.yml" 2>/dev/null; then
-        sed -i "s|REMNAWAVE_API_TOKEN=.*|REMNAWAVE_API_TOKEN=$at|" "$target_dir/docker-compose.yml"
-    fi
-    sleep 1
-    step_ok "${LANG[API_TOKEN_ADDED]}" >&2
-    return 0
-}
+    echo "$r" | jq -e '.' >/dev/null 2>&1 || { echo -e "${COLOR_RED}${LANG[ERROR_DELETE_PROFILE]}${COLOR_RES
