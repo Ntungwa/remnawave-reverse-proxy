@@ -1,44 +1,26 @@
 #!/bin/bash
 # Module: Install Subscription Page Only (Caddy)
 #
-# Standalone subscription page on its own box. No panel, no node, no Xray
-# on this server. Caddy terminates TLS on 443 and obtains its own
-# certificate via ACME on :80. The subscription page container runs on
-# loopback and is proxied by Caddy behind whatever auth the operator chose.
-#
-# Design A note: this file is unchanged from the fork. The Design A shift
-# (Xray owns 443, webserver is a cleartext reverse proxy behind it) doesn't
-# apply because there is no Xray on this box. Caddy already terminates TLS
-# on 443 here.
+# Standalone subscription page. Caddy terminates TLS on 443 (ACME on :80).
+# The reverse_proxy sends X-Forwarded-Proto: https — the subscription page
+# runs ProxyCheckMiddleware and refuses requests without it.
 
 install_sub_caddy() {
     mkdir -p /opt/subscription && cd /opt/subscription
 
     reading "${LANG[ENTER_SUB_DOMAIN]}" SUB_DOMAIN
     check_domain "$SUB_DOMAIN" true true
-    local sub_check_result=$?
-    if [ $sub_check_result -eq 2 ]; then
-        echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
-        exit 1
-    fi
+    [ $? -eq 2 ] && { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
 
     reading "${LANG[ENTER_PANEL_DOMAIN]}" PANEL_DOMAIN
-    if [ -z "$PANEL_DOMAIN" ]; then
-        echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
-        exit 1
-    fi
+    [ -n "$PANEL_DOMAIN" ] || { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
 
     reading "${LANG[ENTER_SUB_API_TOKEN]}" SUB_API_TOKEN
-    if [ -z "$SUB_API_TOKEN" ]; then
-        echo -e "${COLOR_RED}${LANG[EMPTY_TOKEN_ERROR]}${COLOR_RESET}"
-        exit 1
-    fi
+    [ -n "$SUB_API_TOKEN" ] || { echo -e "${COLOR_RED}${LANG[EMPTY_TOKEN_ERROR]}${COLOR_RESET}"; exit 1; }
 
     SUB_AUTH_ENV=""
     while true; do
-        echo -e ""
-        echo -e "${COLOR_GREEN}${LANG[PANEL_AUTH_PROMPT]}${COLOR_RESET}"
-        echo -e ""
+        echo -e ""; echo -e "${COLOR_GREEN}${LANG[PANEL_AUTH_PROMPT]}${COLOR_RESET}"; echo -e ""
         echo -e "${COLOR_YELLOW}1. ${LANG[PANEL_AUTH_OPT_COOKIE]}${COLOR_RESET}"
         echo -e "${COLOR_YELLOW}2. ${LANG[PANEL_AUTH_OPT_TINYAUTH]}${COLOR_RESET}"
         echo -e "${COLOR_YELLOW}3. ${LANG[PANEL_AUTH_OPT_CADDY_MFA]}${COLOR_RESET}"
@@ -48,37 +30,28 @@ install_sub_caddy() {
             1)
                 while true; do
                     reading "${LANG[ENTER_SUB_PANEL_COOKIE]}" SUB_EGAMES_COOKIE
-                    if [[ "$SUB_EGAMES_COOKIE" =~ ^[A-Za-z0-9_]+=[A-Za-z0-9_]+$ ]]; then
-                        break
-                    fi
+                    [[ "$SUB_EGAMES_COOKIE" =~ ^[A-Za-z0-9_]+=[A-Za-z0-9_]+$ ]] && break
                     echo -e "${COLOR_RED}${LANG[INVALID_COOKIE_FORMAT]}${COLOR_RESET}"
                 done
                 SUB_AUTH_ENV=$(printf '\n      - EGAMES_COOKIE=%s' "$SUB_EGAMES_COOKIE")
-                break
-                ;;
+                break ;;
             2)
                 while true; do
                     reading "${LANG[ENTER_TINYAUTH_LOGIN]}" SUB_TINYAUTH_LOGIN
                     reading "${LANG[ENTER_TINYAUTH_PASSWORD]}" SUB_TINYAUTH_PASSWORD
-                    if [ -n "$SUB_TINYAUTH_LOGIN" ] && [ -n "$SUB_TINYAUTH_PASSWORD" ]; then
-                        break
-                    fi
+                    [ -n "$SUB_TINYAUTH_LOGIN" ] && [ -n "$SUB_TINYAUTH_PASSWORD" ] && break
                     echo -e "${COLOR_RED}${LANG[CERT_INVALID_CHOICE]}${COLOR_RESET}"
                 done
                 SUB_AUTH_ENV=$(printf '\n      - CADDY_AUTH_API_TOKEN=Basic %s' "$(printf '%s:%s' "$SUB_TINYAUTH_LOGIN" "$SUB_TINYAUTH_PASSWORD" | base64 | tr -d '\n')")
-                break
-                ;;
+                break ;;
             3)
                 while true; do
                     reading "${LANG[ENTER_SUB_CADDY_KEY]}" SUB_CADDY_KEY
-                    if [[ -n "$SUB_CADDY_KEY" && ! "$SUB_CADDY_KEY" =~ [[:space:]] ]]; then
-                        break
-                    fi
+                    [ -n "$SUB_CADDY_KEY" ] && [[ ! "$SUB_CADDY_KEY" =~ [[:space:]] ]] && break
                     echo -e "${COLOR_RED}${LANG[CERT_INVALID_CHOICE]}${COLOR_RESET}"
                 done
                 SUB_AUTH_ENV=$(printf '\n      - CADDY_AUTH_API_TOKEN=%s' "$SUB_CADDY_KEY")
-                break
-                ;;
+                break ;;
             *) echo -e "${COLOR_RED}${LANG[CERT_INVALID_CHOICE]}${COLOR_RESET}" ;;
         esac
     done
@@ -155,6 +128,7 @@ https://{\$SUB_DOMAIN} {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
+            header_up X-Forwarded-Proto https
         }
     }
 }
@@ -172,19 +146,14 @@ EOL
     sleep 3
     cd /opt/subscription
     docker compose up -d > /dev/null 2>&1 &
-
     spinner $! "${LANG[WAITING]}"
 
     printf "${COLOR_YELLOW}${LANG[SUB_CHECK]}${COLOR_RESET}\n" "$SUB_DOMAIN"
-    local max_attempts=5
-    local attempt=1
-    local delay=15
-
+    local max_attempts=5 attempt=1 delay=15
     while [ $attempt -le $max_attempts ]; do
         printf "${COLOR_YELLOW}${LANG[SUB_ATTEMPT]}${COLOR_RESET}\n" "$attempt" "$max_attempts"
         if curl -s -o /dev/null --max-time 10 "https://$SUB_DOMAIN"; then
-            step_ok "${LANG[SUB_LAUNCHED]}"
-            break
+            step_ok "${LANG[SUB_LAUNCHED]}"; break
         else
             printf "${COLOR_RED}${LANG[SUB_UNAVAILABLE]}${COLOR_RESET}\n" "$attempt"
             if [ $attempt -eq $max_attempts ]; then

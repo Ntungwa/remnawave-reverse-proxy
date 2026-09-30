@@ -2,21 +2,19 @@
 # Module: Install Panel + Node (Caddy, Xray TLS + static ECH on 443)
 #
 # Design A: Xray owns 443, Caddy is a cleartext reverse proxy on a unix
-# socket behind it. Every reverse_proxy sends X-Forwarded-Proto: https —
-# the panel and subscription page both run ProxyCheckMiddleware.
+# socket behind it. Every reverse_proxy sends X-Forwarded-Proto: https.
 #
-# Panel block uses handle /sub/* FIRST so the @unauthorized block cannot
-# serve the camouflage to /sub/ requests.
+# Panel block uses handle /sub/* FIRST so @unauthorized cannot serve the
+# camouflage to /sub/ requests.
 #
 # ECH server key is passed INLINE (base64) to the config profile.
 #
-# Fallback inbounds: one visible host (tag = CP_INBOUND_TAG) plus one
-# hidden host per fallback inbound, all sharing the same tag. The
-# subscription template's remnawave.injectHosts directive injects the
-# hidden hosts as outbounds for every client.
+# All ten hosts are created with isHidden: false so the subscription lists
+# them as ten separate proxies. Each fallback host carries its transport
+# path. The remnawave.injectHosts directive is NOT used.
 #
-# Panel healthcheck start_period 900s — Nest+Prisma boot can exceed 30s.
-# Credential banner runs even when the final docker compose up fails.
+# Panel healthcheck start_period 900s. Credential banner runs even when the
+# final docker compose up fails.
 
 install_panel_node_caddy() {
     load_selfsteal_templates_module
@@ -389,8 +387,8 @@ EOL
             set auth url /r
             allow roles authp/admin
             with api key auth portal remnawaveportal realm local
-            acl rule { comment "Accept"  match role authp/admin  allow stop log info }
-            acl rule { comment "Deny"    match any              deny log warn }
+            acl rule { comment "Accept" match role authp/admin allow stop log info }
+            acl rule { comment "Deny"   match any             deny log warn }
         }
     }
 }
@@ -583,7 +581,6 @@ installation_panel_node_caddy() {
 
     local domain_url="127.0.0.1:3000"
     local target_dir="/opt/remnawave"
-
     sleep 20
 
     step_do "${LANG[CHECK_CONTAINERS]}"
@@ -603,7 +600,6 @@ installation_panel_node_caddy() {
 
     sleep 1
     get_public_key "$domain_url" "$token" "$target_dir" || abort_with_credentials "${LANG[ERROR_EXTRACT_PUBLIC_KEY]}"
-
     delete_config_profile "$domain_url" "$token"
 
     CP_PROFILE_NAME="StealConfig"; CP_INBOUND_TAG="Steal"
@@ -628,34 +624,34 @@ installation_panel_node_caddy() {
         [ -z "$inb_uuid" ] && continue
         [ "$inb_tag" = "$CP_INBOUND_TAG" ] || continue
         create_host "$domain_url" "$token" "$inb_uuid" "$SELFSTEAL_DOMAIN" \
-            "$config_profile_uuid" "Steal" "$CP_INBOUND_TAG" "false" \
+            "$config_profile_uuid" "Steal" "$CP_INBOUND_TAG" "false" "" \
             || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}"
         primary_inbound_uuid="$inb_uuid"
         break
     done <<< "$inbound_lines"
-    [ -n "$primary_inbound_uuid" ] || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}: primary inbound missing"
+    [ -n "$primary_inbound_uuid" ] || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}: primary inbound not found"
 
     create_node "$domain_url" "$token" "$config_profile_uuid" "$primary_inbound_uuid" \
         || abort_with_credentials "${LANG[ERROR_CREATE_NODE]}"
 
-    # Hidden hosts for the fallbacks.
+    # Fallback hosts — one per inbound, all visible, each with its transport path.
     while IFS=: read -r inb_tag inb_uuid; do
         [ -z "$inb_uuid" ] && continue
         [ "$inb_tag" = "$CP_INBOUND_TAG" ] && continue
-        local remark="$inb_tag"
+        local remark="$inb_tag" hpath=""
         case "$inb_tag" in
-            *-vless-ws)        remark="Steal-vless-ws" ;;
-            *-vless-hu)        remark="Steal-vless-hu" ;;
-            *-vless-xhttp)     remark="Steal-vless-xhttp" ;;
-            *-vless-tcp-obfs)  remark="Steal-vless-tcp-obfs" ;;
-            *-trojan-ws)       remark="Steal-trojan-ws" ;;
-            *-trojan-hu)       remark="Steal-trojan-hu" ;;
-            *-trojan-tcp-obfs) remark="Steal-trojan-tcp-obfs" ;;
-            *-ss-ws)           remark="Steal-ss-ws" ;;
-            *-ss-tcp-obfs)     remark="Steal-ss-tcp-obfs" ;;
+            *-vless-ws)        remark="Steal-vless-ws";        hpath="/vlws" ;;
+            *-vless-hu)        remark="Steal-vless-hu";        hpath="/vhu"  ;;
+            *-vless-xhttp)     remark="Steal-vless-xhttp";     hpath="/vxh"  ;;
+            *-vless-tcp-obfs)  remark="Steal-vless-tcp-obfs";  hpath="/vltc" ;;
+            *-trojan-ws)       remark="Steal-trojan-ws";       hpath="/trws" ;;
+            *-trojan-hu)       remark="Steal-trojan-hu";       hpath="/thu"  ;;
+            *-trojan-tcp-obfs) remark="Steal-trojan-tcp-obfs"; hpath="/trtc" ;;
+            *-ss-ws)           remark="Steal-ss-ws";           hpath="/ssws" ;;
+            *-ss-tcp-obfs)     remark="Steal-ss-tcp-obfs";     hpath="/sstc" ;;
         esac
         create_host "$domain_url" "$token" "$inb_uuid" "$SELFSTEAL_DOMAIN" \
-            "$config_profile_uuid" "$remark" "$CP_INBOUND_TAG" "true" \
+            "$config_profile_uuid" "$remark" "$CP_INBOUND_TAG" "false" "$hpath" \
             || abort_with_credentials "${LANG[ERROR_CREATE_HOST]}"
     done <<< "$inbound_lines"
 
@@ -672,8 +668,6 @@ installation_panel_node_caddy() {
     if [ -n "$CP_ECH_PUBLIC_CONFIG" ]; then
         ensure_ech_subscription_templates "$domain_url" "$token" "$CP_ECH_PUBLIC_CONFIG" || true
     fi
-
-    ensure_subscription_template_inject "$domain_url" "$token" || true
 
     step_do "${LANG[STOPPING_REMNAWAVE]}"
     sleep 1

@@ -1,31 +1,21 @@
 #!/bin/bash
 # Module: Install Panel Only (Caddy)
 #
-# No Xray on this box, so Caddy terminates TLS on 443 with its own
-# certificates. This is the one installer under Design A where Caddy holds
-# the certs. The direct domain is asked for anyway: it is the ECH
-# serverName that the panel will hand downstream to every node it manages,
-# and `xray tls ech` binds to it without needing the domain's cert here.
+# No Xray on this box — Caddy terminates TLS on 443 with its own ACME certs.
+# Direct domain is asked for to bind the ECH keypair (used by remote nodes).
 #
-# Domain layout:
-#   default (bonded): 2 domains — CDN (panel + /sub) and Direct.
-#   optional split:   3 domains — panel, sub, direct.
+# Every reverse_proxy sends X-Forwarded-Proto: https (ProxyCheckMiddleware
+# rejects requests without it, causing 502s).
 #
-# Every reverse_proxy that reaches the Remnawave backend sends
-# X-Forwarded-Proto: https — the backend's ProxyCheckMiddleware rejects
-# requests without it ("Reverse proxy and HTTPS are required"), which
-# surfaces as a 502.
+# Panel healthcheck start_period 900s. Credential banner runs even when the
+# final docker compose up fails.
 
 install_panel_caddy() {
     mkdir -p /opt/remnawave && cd /opt/remnawave
 
     reading "${LANG[ENTER_PANEL_DOMAIN]}" PANEL_DOMAIN
     check_domain "$PANEL_DOMAIN" true true
-    local panel_check_result=$?
-    if [ $panel_check_result -eq 2 ]; then
-        echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
-        exit 1
-    fi
+    [ $? -eq 2 ] && { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
 
     local split_sub="n"
     printf ' %s' "$(question "${LANG[SUB_ON_PANEL_PATH_ASK]}")"
@@ -36,11 +26,7 @@ install_panel_caddy() {
         SUB_ON_PANEL_PATH=false
         reading "${LANG[ENTER_SUB_DOMAIN]}" SUB_DOMAIN
         check_domain "$SUB_DOMAIN" true true
-        local sub_check_result=$?
-        if [ $sub_check_result -eq 2 ]; then
-            echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"
-            exit 1
-        fi
+        [ $? -eq 2 ] && { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
     else
         SUB_ON_PANEL_PATH=true
         SUB_DOMAIN="$PANEL_DOMAIN"
@@ -48,54 +34,38 @@ install_panel_caddy() {
 
     reading "${LANG[ENTER_NODE_DOMAIN]}" SELFSTEAL_DOMAIN
     if ! [[ "$SELFSTEAL_DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; then
-        echo -e "${COLOR_RED}${LANG[CERT_MANUAL_BAD_DOMAIN]}${COLOR_RESET}"
-        exit 1
+        echo -e "${COLOR_RED}${LANG[CERT_MANUAL_BAD_DOMAIN]}${COLOR_RESET}"; exit 1
     fi
-
     if [ "$PANEL_DOMAIN" = "$SELFSTEAL_DOMAIN" ] || [ "$SUB_DOMAIN" = "$SELFSTEAL_DOMAIN" ]; then
-        echo -e "${COLOR_RED}${LANG[DOMAINS_MUST_BE_UNIQUE]}${COLOR_RESET}"
-        exit 1
+        echo -e "${COLOR_RED}${LANG[DOMAINS_MUST_BE_UNIQUE]}${COLOR_RESET}"; exit 1
     fi
 
     PANEL_BASE_DOMAIN=$(extract_domain "$PANEL_DOMAIN")
-
     unique_domains["$PANEL_BASE_DOMAIN"]=1
-    if [ "$SUB_ON_PANEL_PATH" = false ]; then
-        SUB_BASE_DOMAIN=$(extract_domain "$SUB_DOMAIN")
-        unique_domains["$SUB_BASE_DOMAIN"]=1
-    fi
+    [ "$SUB_ON_PANEL_PATH" = false ] && unique_domains["$(extract_domain "$SUB_DOMAIN")"]=1
 
     PANEL_AUTH_MODE=cookie
     CADDY_IMAGE="caddy:2.11.4"
     AUTHP_ENV=""
     while true; do
-        echo -e ""
-        echo -e "${COLOR_GREEN}${LANG[PANEL_AUTH_PROMPT]}${COLOR_RESET}"
-        echo -e ""
+        echo -e ""; echo -e "${COLOR_GREEN}${LANG[PANEL_AUTH_PROMPT]}${COLOR_RESET}"; echo -e ""
         echo -e "${COLOR_YELLOW}1. ${LANG[PANEL_AUTH_OPT_COOKIE]}${COLOR_RESET}"
         echo -e "${COLOR_YELLOW}2. ${LANG[PANEL_AUTH_OPT_PORTAL]}${COLOR_RESET}"
         echo -e ""
-        reading "${LANG[PANEL_AUTH_PROMPT_CHOOSE]}" auth_choice
-        case "$auth_choice" in
+        reading "${LANG[PANEL_AUTH_PROMPT_CHOOSE]}" ac
+        case "$ac" in
             1) break ;;
-            2)
-                PANEL_AUTH_MODE=portal
-                CADDY_IMAGE="remnawave/caddy-with-auth:latest"
-                break
-                ;;
+            2) PANEL_AUTH_MODE=portal; CADDY_IMAGE="remnawave/caddy-with-auth:latest"; break ;;
             *) echo -e "${COLOR_RED}${LANG[CERT_INVALID_CHOICE]}${COLOR_RESET}" ;;
         esac
     done
 
     SUPERADMIN_USERNAME=$(generate_user)
     SUPERADMIN_PASSWORD=$(generate_password)
-
     cookies_random1=$(generate_user)
     cookies_random2=$(generate_user)
-
     METRICS_USER=$(generate_user)
     METRICS_PASS=$(generate_user)
-
     APP_SECRET=$(openssl rand -hex 64)
 
     if [ "$PANEL_AUTH_MODE" = "portal" ]; then
@@ -108,11 +78,9 @@ install_panel_caddy() {
 
     local sub_public_domain sub_custom_prefix
     if [ "$SUB_ON_PANEL_PATH" = true ]; then
-        sub_public_domain="${PANEL_DOMAIN}/sub"
-        sub_custom_prefix="/sub"
+        sub_public_domain="${PANEL_DOMAIN}/sub"; sub_custom_prefix="/sub"
     else
-        sub_public_domain="$SUB_DOMAIN"
-        sub_custom_prefix=""
+        sub_public_domain="$SUB_DOMAIN"; sub_custom_prefix=""
     fi
 
     if ! docker image inspect remnawave/node:latest >/dev/null 2>&1; then
@@ -120,8 +88,7 @@ install_panel_caddy() {
         docker pull remnawave/node:latest >/dev/null 2>&1 || true
     fi
 
-    CP_ECH_KEY_PATH=""
-    CP_ECH_PUBLIC_CONFIG=""
+    CP_ECH_KEY_PATH=""; CP_ECH_SERVER_KEYS_B64=""; CP_ECH_PUBLIC_CONFIG=""
     ensure_ech_server_keys "/opt/remnawave" "$SELFSTEAL_DOMAIN" || true
 
     cat > .env <<EOL
@@ -247,7 +214,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 900s
     depends_on:
       remnawave-db:
         condition: service_healthy
@@ -349,7 +316,6 @@ EOL
             realm local
             path /data/.local/caddy/users.json
         }
-
         authentication portal remnawaveportal {
             crypto default token lifetime {\$AUTH_TOKEN_LIFETIME}
             enable identity store localdb
@@ -368,21 +334,12 @@ EOL
                 require mfa
             }
         }
-
         authorization policy panelpolicy {
             set auth url /r
             allow roles authp/admin
             with api key auth portal remnawaveportal realm local
-            acl rule {
-                comment "Accept"
-                match role authp/admin
-                allow stop log info
-            }
-            acl rule {
-                comment "Deny"
-                match any
-                deny log warn
-            }
+            acl rule { comment "Accept" match role authp/admin allow stop log info }
+            acl rule { comment "Deny"   match any             deny log warn }
         }
     }
 }
@@ -390,37 +347,35 @@ EOL
 https://{\$PANEL_DOMAIN} {
     encode
 
-    route /sub/* {
+    handle /sub/* {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
             header_up X-Forwarded-Proto https
         }
     }
-
-    route /api/* {
+    handle /api/* {
         reverse_proxy {\$BACKEND_URL} {
             header_up X-Real-IP {remote}
             header_up Host {host}
             header_up X-Forwarded-Proto https
         }
     }
-    route /oauth2/* {
+    handle /oauth2/* {
         reverse_proxy {\$BACKEND_URL} {
             header_up Host {host}
             header_up X-Forwarded-Proto https
         }
     }
-
     handle /r {
         rewrite * /auth
         request_header +X-Forwarded-Prefix /r
         authenticate with remnawaveportal
     }
-    route /r* {
+    handle /r* {
         authenticate with remnawaveportal
     }
-    route /* {
+    handle {
         authorize with panelpolicy
         reverse_proxy {\$BACKEND_URL} {
             header_up X-Real-IP {remote}
@@ -439,9 +394,15 @@ EOL
 https://{\$PANEL_DOMAIN} {
     encode
 
-    route /sub/* {
+    handle /sub/* {
         reverse_proxy {\$SUB_BACKEND_URL} {
             header_up X-Real-IP {remote}
+            header_up Host {host}
+            header_up X-Forwarded-Proto https
+        }
+    }
+    handle /oauth2/* {
+        reverse_proxy {\$BACKEND_URL} {
             header_up Host {host}
             header_up X-Forwarded-Proto https
         }
@@ -452,32 +413,25 @@ https://{\$PANEL_DOMAIN} {
     }
     handle @has_token_param {
         header +Set-Cookie "$cookies_random1=$cookies_random2; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000"
-    }
-
-    @unauthorized {
-        not path /oauth2/*
-        not header Cookie *$cookies_random1=$cookies_random2*
-        not query $cookies_random1=$cookies_random2
-    }
-    handle @unauthorized {
-        abort
-    }
-
-    @oauth2_callback {
-        path /oauth2/*
-        query code=* state=*
-    }
-    handle @oauth2_callback {
         reverse_proxy {\$BACKEND_URL} {
+            header_up X-Real-IP {remote}
             header_up Host {host}
             header_up X-Forwarded-Proto https
         }
     }
 
-    reverse_proxy {\$BACKEND_URL} {
-        header_up X-Real-IP {remote}
-        header_up Host {host}
-        header_up X-Forwarded-Proto https
+    @unauthorized {
+        not header Cookie *$cookies_random1=$cookies_random2*
+        not query $cookies_random1=$cookies_random2
+    }
+    handle @unauthorized { abort }
+
+    handle {
+        reverse_proxy {\$BACKEND_URL} {
+            header_up X-Real-IP {remote}
+            header_up Host {host}
+            header_up X-Forwarded-Proto https
+        }
     }
 }
 EOL
@@ -512,16 +466,12 @@ installation_panel_caddy() {
 
     declare -A domains_to_check
     domains_to_check["$PANEL_DOMAIN"]=1
-    if [ "$SUB_ON_PANEL_PATH" = false ]; then
-        domains_to_check["$SUB_DOMAIN"]=1
-    fi
+    [ "$SUB_ON_PANEL_PATH" = false ] && domains_to_check["$SUB_DOMAIN"]=1
 
     handle_certificates domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" "/opt/remnawave" || return 1
 
     PANEL_CERT_DOMAIN=$(resolve_certificate_domain "$PANEL_DOMAIN") || return 1
-    if [ "$SUB_ON_PANEL_PATH" = false ]; then
-        SUB_CERT_DOMAIN=$(resolve_certificate_domain "$SUB_DOMAIN") || return 1
-    fi
+    [ "$SUB_ON_PANEL_PATH" = false ] && { SUB_CERT_DOMAIN=$(resolve_certificate_domain "$SUB_DOMAIN") || return 1; }
 
     for domain in "${!domains_to_check[@]}"; do
         local lineage conf
@@ -539,7 +489,6 @@ installation_panel_caddy() {
 
     local domain_url="127.0.0.1:3000"
     local target_dir="/opt/remnawave"
-
     sleep 20
 
     step_do "${LANG[CHECK_CONTAINERS]}"
@@ -548,19 +497,14 @@ installation_panel_caddy() {
         --header 'X-Forwarded-For: 127.0.0.1' \
         --header 'X-Forwarded-Proto: https' > /dev/null; do
         attempts=$((attempts + 1))
-        if [ "$attempts" -ge "$max_attempts" ]; then
-            error "$(printf "${LANG[CONTAINERS_TIMEOUT]}" $max_attempts)"
-        fi
+        [ "$attempts" -ge "$max_attempts" ] && error "$(printf "${LANG[CONTAINERS_TIMEOUT]}" $max_attempts)"
         echo -e "${COLOR_RED}$(printf "${LANG[CONTAINERS_NOT_READY_ATTEMPT]}" $attempts $max_attempts)${COLOR_RESET}"
         sleep 60
     done
 
     local token
     token=$(register_remnawave "$domain_url" "$SUPERADMIN_USERNAME" "$SUPERADMIN_PASSWORD")
-    case "$token" in
-        ey*) ;;
-        *) abort_with_credentials "${LANG[ERROR_REGISTER]}: $token" ;;
-    esac
+    case "$token" in ey*) ;; *) abort_with_credentials "${LANG[ERROR_REGISTER]}: $token" ;; esac
 
     persist_script_api_token "$token"
     create_api_token "$domain_url" "$token" "$target_dir"
