@@ -18,6 +18,14 @@
 # else. Inbound tags use lowercase + hyphens; the sanitizer upper-cases and
 # replaces the rest so the visible and hidden hosts all land on the same
 # compliant tag.
+#
+# Subscription templates endpoint (Remnawave 3.x):
+#   GET  /api/subscription-templates         -> {"response":{"total":N,"templates":[…]}}
+#   GET  /api/subscription-templates/<uuid>  -> {"response":{…,"templateJson":{…}}}
+#   PATCH /api/subscription-templates        -> body {uuid,name,templateType,templateJson:<object>}
+# Note: `templateJson` is an OBJECT, not a string. Writing it back as a
+# string is silently rejected by the panel — the PATCH must send it with
+# --argjson, and the read side must jq -c it first.
 
 err_msg() { echo -e "${COLOR_RED}$*${COLOR_RESET}" >&2; }
 
@@ -193,11 +201,6 @@ get_public_key() {
     if [ -z "$pk" ] || [ "$pk" = "null" ]; then
         echo -e "${COLOR_RED}${LANG[ERROR_EXTRACT_PUBLIC_KEY]}: $r${COLOR_RESET}"; return 1
     fi
-
-    # The secretKey is itself a JSON document. sed-ing it into a
-    # double-quoted YAML scalar produces SECRET_KEY="{"..."}" which
-    # docker compose cannot parse. Single-quoted YAML keeps inner double
-    # quotes literal; any single quote is doubled.
     local compose="$target_dir/docker-compose.yml"
     if command -v python3 >/dev/null 2>&1; then
         python3 - "$compose" "$pk" <<'PY'
@@ -217,7 +220,6 @@ PY
     step_ok "${LANG[PUBLIC_KEY_SUCCESS]}"
 }
 
-# Kept for backward compatibility with callers that still expect it.
 generate_xray_keys() {
     local domain_url=$1 token=$2
     step_do "${LANG[GENERATE_KEYS]}" >&2
@@ -238,19 +240,6 @@ generate_xray_keys() {
 
 # ---------------------------------------------------------------------------
 # Static ECH key management
-#
-# `xray tls ech --serverName <name>` on Xray 26.x prints:
-#     ECH config list:
-#     AGP+DQBfAAAgAC...
-#     ECH server keys:
-#     ACBFJMM4dfJ...
-#
-# echServerKeys is a base64 string fed to base64.StdEncoding.DecodeString —
-# it must be the SECOND blob inline. Passing a file path makes Xray try to
-# decode the path and fail with "invalid ECH Config<path>".
-#
-# Sets: CP_ECH_KEY_PATH (reference), CP_ECH_SERVER_KEYS_B64 (base64,
-# consumed by the profile), CP_ECH_PUBLIC_CONFIG (ECHConfigList).
 # ---------------------------------------------------------------------------
 ensure_ech_server_keys() {
     local target_dir="$1" selfsteal_domain="$2"
@@ -286,7 +275,6 @@ ensure_ech_server_keys() {
         remnawave/node:latest tls ech --serverName "$selfsteal_domain" 2>/dev/null)
     [ -z "$raw" ] && { echo -e "${COLOR_YELLOW}${LANG[ECH_KEYGEN_FAIL]}${COLOR_RESET}"; return 1; }
 
-    # Server key blob — everything after "ECH server keys:", stripped.
     local kb
     kb=$(printf '%s\n' "$raw" | sed -n '/ECH server keys:/,$p' | tail -n +2 | tr -d '[:space:]:')
     [ -z "$kb" ] && kb=$(printf '%s\n' "$raw" | sed -n 's/.*ECH server keys:[[:space:]]*//p' | tr -d '[:space:]:')
@@ -296,7 +284,6 @@ ensure_ech_server_keys() {
     printf '%s' "$kb" > "$server_file"; chmod 640 "$server_file"
     CP_ECH_SERVER_KEYS_B64="$kb"
 
-    # Public ECHConfigList.
     local pc
     pc=$(printf '%s\n' "$raw" | sed -n '/ECH config list:/,/ECH server keys:/p' | sed '1d;$d' | tr -d '[:space:]:')
     [ -z "$pc" ] && pc=$(printf '%s\n' "$raw" | sed -n '/ECH Config:/,/ECH server keys:/p' | sed '1d;$d' | tr -d '[:space:]:')
@@ -316,19 +303,25 @@ ensure_ech_server_keys() {
 }
 
 # ---------------------------------------------------------------------------
-# Subscription template — ECH injection (echConfigList on outbound tlsSettings)
+# Subscription template — ECH injection
+#
+# Reads each XRAY_JSON template's templateJson (an OBJECT), adds
+# echConfigList next to every tlsSettings.serverName that lacks one, and
+# PATCHes the object back with --argjson.
 # ---------------------------------------------------------------------------
 ensure_ech_subscription_templates() {
     local domain_url=$1 token=$2 ech_b64="$3"
     [ -z "$ech_b64" ] && { echo -e "${COLOR_YELLOW}${LANG[ECH_TEMPLATE_NO_KEY]}${COLOR_RESET}"; return 1; }
     step_do "${LANG[ECH_TEMPLATE_SETUP]}"
+
     local list
     list=$(make_api_request "GET" "http://$domain_url/api/subscription-templates" "$token")
-    if [ -z "$list" ] || ! echo "$list" | jq -e '.response.subscriptionTemplates' >/dev/null 2>&1; then
+    if [ -z "$list" ] || ! echo "$list" | jq -e '.response.templates' >/dev/null 2>&1; then
         echo -e "${COLOR_YELLOW}${LANG[ECH_TEMPLATE_FETCH_FAIL]}${COLOR_RESET}"; return 1
     fi
+
     local uuids
-    uuids=$(echo "$list" | jq -r '.response.subscriptionTemplates[]? | select(.templateType=="XRAY_JSON") | .uuid')
+    uuids=$(echo "$list" | jq -r '.response.templates[]? | select(.templateType=="XRAY_JSON") | .uuid')
     [ -z "$uuids" ] && { echo -e "${COLOR_YELLOW}${LANG[ECH_TEMPLATE_NONE_XRAYJSON]}${COLOR_RESET}"; return 1; }
 
     local uuid tpl name body patched ub resp
@@ -337,15 +330,22 @@ ensure_ech_subscription_templates() {
         tpl=$(make_api_request "GET" "http://$domain_url/api/subscription-templates/$uuid" "$token")
         [ -z "$tpl" ] && { failed=$((failed+1)); continue; }
         name=$(echo "$tpl" | jq -r '.response.name // empty')
-        body=$(echo "$tpl" | jq -r '.response.templateJson // empty')
-        [ -z "$body" ] && { failed=$((failed+1)); continue; }
+        body=$(echo "$tpl" | jq -c '.response.templateJson // empty')
+        if [ -z "$body" ] || [ "$body" = "null" ]; then
+            failed=$((failed+1)); continue
+        fi
+
         if printf '%s' "$body" | jq -e '[.. | objects | select(has("echConfigList"))] | length > 0' >/dev/null 2>&1; then
             skipped=$((skipped+1)); continue
         fi
+
         patched=$(printf '%s' "$body" | jq -c --arg e "$ech_b64" \
             '(.. | objects | select(has("serverName") and (has("echConfigList") | not))) |= . + {echConfigList: $e}' 2>/dev/null)
-        if [ -z "$patched" ] || [ "$patched" = "$body" ]; then skipped=$((skipped+1)); continue; fi
-        ub=$(jq -n --arg u "$uuid" --arg n "$name" --arg b "$patched" \
+        if [ -z "$patched" ] || [ "$patched" = "$body" ]; then
+            skipped=$((skipped+1)); continue
+        fi
+
+        ub=$(jq -n --arg u "$uuid" --arg n "$name" --argjson b "$patched" \
             '{uuid:$u,name:$n,templateType:"XRAY_JSON",templateJson:$b}')
         resp=$(make_api_request "PATCH" "http://$domain_url/api/subscription-templates" "$token" "$ub")
         if echo "$resp" | jq -e '.response.uuid' >/dev/null 2>&1; then
@@ -370,9 +370,6 @@ ensure_ech_subscription_templates() {
 #         "useHostRemarkAsTag": true }
 #     ]
 #   }
-#
-# The visible host becomes outbound tag "proxy"; every hidden host sharing
-# the same tag is injected as an outbound whose tag is the host's remark.
 # ---------------------------------------------------------------------------
 ensure_subscription_template_inject() {
     local domain_url=$1 token=$2
@@ -380,11 +377,11 @@ ensure_subscription_template_inject() {
 
     local list
     list=$(make_api_request "GET" "http://$domain_url/api/subscription-templates" "$token")
-    if [ -z "$list" ] || ! echo "$list" | jq -e '.response.subscriptionTemplates' >/dev/null 2>&1; then
+    if [ -z "$list" ] || ! echo "$list" | jq -e '.response.templates' >/dev/null 2>&1; then
         echo -e "${COLOR_YELLOW}Cannot fetch subscription templates${COLOR_RESET}"; return 1
     fi
     local uuids
-    uuids=$(echo "$list" | jq -r '.response.subscriptionTemplates[]? | select(.templateType=="XRAY_JSON") | .uuid')
+    uuids=$(echo "$list" | jq -r '.response.templates[]? | select(.templateType=="XRAY_JSON") | .uuid')
     [ -z "$uuids" ] && { echo -e "${COLOR_YELLOW}No XRAY_JSON templates${COLOR_RESET}"; return 1; }
 
     local uuid tpl name body patched ub resp
@@ -393,8 +390,10 @@ ensure_subscription_template_inject() {
         tpl=$(make_api_request "GET" "http://$domain_url/api/subscription-templates/$uuid" "$token")
         [ -z "$tpl" ] && { failed=$((failed+1)); continue; }
         name=$(echo "$tpl" | jq -r '.response.name // empty')
-        body=$(echo "$tpl" | jq -r '.response.templateJson // empty')
-        [ -z "$body" ] && { failed=$((failed+1)); continue; }
+        body=$(echo "$tpl" | jq -c '.response.templateJson // empty')
+        if [ -z "$body" ] || [ "$body" = "null" ]; then
+            failed=$((failed+1)); continue
+        fi
 
         if printf '%s' "$body" | jq -e '.remnawave.injectHosts' >/dev/null 2>&1; then
             skipped=$((skipped+1)); continue
@@ -413,7 +412,7 @@ ensure_subscription_template_inject() {
             skipped=$((skipped+1)); continue
         fi
 
-        ub=$(jq -n --arg u "$uuid" --arg n "$name" --arg b "$patched" \
+        ub=$(jq -n --arg u "$uuid" --arg n "$name" --argjson b "$patched" \
             '{uuid:$u,name:$n,templateType:"XRAY_JSON",templateJson:$b}')
         resp=$(make_api_request "PATCH" "http://$domain_url/api/subscription-templates" "$token" "$ub")
         if echo "$resp" | jq -e '.response.uuid' >/dev/null 2>&1; then
@@ -492,9 +491,7 @@ delete_config_profile() {
 
 # ---------------------------------------------------------------------------
 # Config profile creation
-#
-# Emits:  line 1 = config profile UUID
-#         each subsequent line = "<tag>:<inbound_uuid>"
+# Emits:  line 1 = config profile UUID; then "<tag>:<inbound_uuid>" per inbound.
 # ---------------------------------------------------------------------------
 create_config_profile() {
     local domain_url=$1 token=$2
@@ -622,16 +619,7 @@ create_config_profile() {
 }
 
 # ---------------------------------------------------------------------------
-# Host creation
-#
-# Args: $1 domain_url  $2 token  $3 inbound_uuid  $4 address  $5 config_uuid
-#       $6 remark  $7 host_tag  $8 is_hidden (true/false)
-#
-# Host tags must match /^[A-Z0-9_:]+$/ — the inbound tag is sanitized
-# (uppercase, illegal chars replaced with underscore) so the visible host
-# and every fallback host share one compliant tag. The subscription
-# template's sameTagAsRecipient selector picks the hidden ones up by that
-# shared tag.
+# Host creation with tag sanitizer
 # ---------------------------------------------------------------------------
 create_host() {
     local domain_url=$1 token=$2 iu=$3 addr=$4 cu=$5
@@ -739,7 +727,7 @@ create_api_token() {
         fi
         chmod 600 "$ef" 2>/dev/null
     fi
-    if grep -qE 'REMNAWAWE_API_TOKEN=[^$[:space:]]' "$target_dir/docker-compose.yml" 2>/dev/null; then
+    if grep -qE 'REMNAWAVE_API_TOKEN=[^$[:space:]]' "$target_dir/docker-compose.yml" 2>/dev/null; then
         sed -i "s|REMNAWAVE_API_TOKEN=.*|REMNAWAVE_API_TOKEN=$at|" "$target_dir/docker-compose.yml"
     fi
     sleep 1
