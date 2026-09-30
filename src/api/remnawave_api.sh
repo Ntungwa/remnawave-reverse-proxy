@@ -1,31 +1,5 @@
 #!/bin/bash
 # Module: Remnawave API Functions
-#
-# Design A: Xray owns 443 and holds every certificate plus the static ECH
-# key. The webserver (nginx or caddy) is a cleartext reverse proxy on a
-# unix socket behind Xray.
-#
-# ECH: the server-key base64 blob is passed INLINE as echServerKeys — Xray
-# decodes that field with base64.StdEncoding and a file path is not base64.
-# The file on disk is a reference copy.
-#
-# Fallback inbounds: one visible host (tag derived from CP_INBOUND_TAG)
-# plus one hidden host per fallback inbound, all sharing the same host tag.
-# The subscription template's remnawave.injectHosts directive injects the
-# hidden hosts as client outbounds.
-#
-# Host tags are normalized to /^[A-Z0-9_:]+$/ — Remnawave rejects anything
-# else. Inbound tags use lowercase + hyphens; the sanitizer upper-cases and
-# replaces the rest so the visible and hidden hosts all land on the same
-# compliant tag.
-#
-# Subscription templates endpoint (Remnawave 3.x):
-#   GET  /api/subscription-templates         -> {"response":{"total":N,"templates":[…]}}
-#   GET  /api/subscription-templates/<uuid>  -> {"response":{…,"templateJson":{…}}}
-#   PATCH /api/subscription-templates        -> body {uuid,name,templateType,templateJson:<object>}
-# Note: `templateJson` is an OBJECT, not a string. Writing it back as a
-# string is silently rejected by the panel — the PATCH must send it with
-# --argjson, and the read side must jq -c it first.
 
 err_msg() { echo -e "${COLOR_RED}$*${COLOR_RESET}" >&2; }
 
@@ -44,10 +18,6 @@ make_api_request() {
         curl -s --connect-timeout 10 --max-time 60 -X "$method" "$url" "${headers[@]}"
     fi
 }
-
-# ---------------------------------------------------------------------------
-# Token introspection and minting
-# ---------------------------------------------------------------------------
 
 rw_token_is_api() {
     local tok="$1"; [ -n "$tok" ] || return 1
@@ -78,10 +48,6 @@ persist_script_api_token() {
     chmod 600 "$file" 2>/dev/null
 }
 
-# ---------------------------------------------------------------------------
-# Panel registration, login, key retrieval
-# ---------------------------------------------------------------------------
-
 register_remnawave() {
     local domain_url=$1 username=$2 password=$3 token=$4
     local d
@@ -89,14 +55,11 @@ register_remnawave() {
     step_do "${LANG[REGISTERING_REMNAWAVE]}" >&2
     local r
     r=$(make_api_request "POST" "http://$domain_url/api/auth/register" "$token" "$d")
-    if [ -z "$r" ]; then
-        err_msg "${LANG[ERROR_EMPTY_RESPONSE_REGISTER]}"; return 1
+    if [ -z "$r" ]; then err_msg "${LANG[ERROR_EMPTY_RESPONSE_REGISTER]}"; return 1
     elif [[ "$r" == *"accessToken"* ]]; then
         step_ok "${LANG[REGISTRATION_SUCCESS]}" >&2
         echo "$r" | jq -r '.response.accessToken'; return 0
-    else
-        err_msg "${LANG[ERROR_REGISTER]}: $r"; return 1
-    fi
+    else err_msg "${LANG[ERROR_REGISTER]}: $r"; return 1; fi
 }
 
 panel_login_url() {
@@ -124,8 +87,7 @@ panel_login_url() {
 get_panel_token() {
     TOKEN_FILE="${DIR_REMNAWAVE}/token"
     local domain_url="127.0.0.1:3000"
-    local ast
-    ast=$(make_api_request "GET" "http://${domain_url}/api/auth/status" "")
+    local ast; ast=$(make_api_request "GET" "http://${domain_url}/api/auth/status" "")
     local oauth=false prov=""
     if [ -n "$ast" ]; then
         local g y p t
@@ -193,11 +155,9 @@ get_panel_token() {
 get_public_key() {
     local domain_url=$1 token=$2 target_dir=$3
     step_do "${LANG[GET_PUBLIC_KEY]}"
-    local r
-    r=$(make_api_request "GET" "http://$domain_url/api/keygen" "$token")
+    local r; r=$(make_api_request "GET" "http://$domain_url/api/keygen" "$token")
     [ -z "$r" ] && { echo -e "${COLOR_RED}${LANG[ERROR_PUBLIC_KEY]}${COLOR_RESET}"; return 1; }
-    local pk
-    pk=$(echo "$r" | jq -r '.response.secretKey // .response.pubKey // empty')
+    local pk; pk=$(echo "$r" | jq -r '.response.secretKey // .response.pubKey // empty')
     if [ -z "$pk" ] || [ "$pk" = "null" ]; then
         echo -e "${COLOR_RED}${LANG[ERROR_EXTRACT_PUBLIC_KEY]}: $r${COLOR_RESET}"; return 1
     fi
@@ -223,24 +183,17 @@ PY
 generate_xray_keys() {
     local domain_url=$1 token=$2
     step_do "${LANG[GENERATE_KEYS]}" >&2
-    local r
-    r=$(make_api_request "GET" "http://$domain_url/api/system/tools/x25519/generate" "$token")
+    local r; r=$(make_api_request "GET" "http://$domain_url/api/system/tools/x25519/generate" "$token")
     [ -z "$r" ] && { err_msg "${LANG[ERROR_GENERATE_KEYS]}"; return 1; }
     if echo "$r" | jq -e '.errorCode' >/dev/null 2>&1; then
         err_msg "${LANG[ERROR_GENERATE_KEYS]}: $(echo "$r" | jq -r '.message')"; return 1
     fi
-    local pk
-    pk=$(echo "$r" | jq -r '.response.keypairs[0].privateKey')
-    if [ -z "$pk" ] || [ "$pk" = "null" ]; then
-        err_msg "${LANG[ERROR_EXTRACT_PRIVATE_KEY]}"; return 1
-    fi
+    local pk; pk=$(echo "$r" | jq -r '.response.keypairs[0].privateKey')
+    [ -z "$pk" ] || [ "$pk" = "null" ] && { err_msg "${LANG[ERROR_EXTRACT_PRIVATE_KEY]}"; return 1; }
     step_ok "${LANG[GENERATE_KEYS_SUCCESS]}" >&2
     echo "$pk"; return 0
 }
 
-# ---------------------------------------------------------------------------
-# Static ECH key management
-# ---------------------------------------------------------------------------
 ensure_ech_server_keys() {
     local target_dir="$1" selfsteal_domain="$2"
     local ech_dir="$target_dir/ech"
@@ -248,18 +201,14 @@ ensure_ech_server_keys() {
     local client_file="$ech_dir/client-config.txt"
     local client_json="$ech_dir/client-config.json"
 
-    CP_ECH_KEY_PATH=""
-    CP_ECH_SERVER_KEYS_B64=""
-    CP_ECH_PUBLIC_CONFIG=""
-
+    CP_ECH_KEY_PATH=""; CP_ECH_SERVER_KEYS_B64=""; CP_ECH_PUBLIC_CONFIG=""
     mkdir -p "$ech_dir"; chmod 750 "$ech_dir"
 
     if [ -s "$server_file" ] && ! LC_ALL=C grep -qE '[^A-Za-z0-9+/=]' "$server_file"; then
         CP_ECH_KEY_PATH="/etc/xray/ech/server-keys.txt"
         CP_ECH_SERVER_KEYS_B64=$(cat "$server_file")
         [ -s "$client_file" ] && CP_ECH_PUBLIC_CONFIG=$(cat "$client_file")
-        step_ok "${LANG[ECH_KEYGEN_REUSED]}"
-        return 0
+        step_ok "${LANG[ECH_KEYGEN_REUSED]}"; return 0
     fi
 
     step_do "${LANG[ECH_KEYGEN]}"
@@ -270,8 +219,7 @@ ensure_ech_server_keys() {
         echo -e "${COLOR_YELLOW}${LANG[ECH_KEYGEN_IMG_MISSING]}${COLOR_RESET}"; return 1
     fi
 
-    local raw
-    raw=$(docker run --rm --entrypoint /usr/local/bin/xray \
+    local raw; raw=$(docker run --rm --entrypoint /usr/local/bin/xray \
         remnawave/node:latest tls ech --serverName "$selfsteal_domain" 2>/dev/null)
     [ -z "$raw" ] && { echo -e "${COLOR_YELLOW}${LANG[ECH_KEYGEN_FAIL]}${COLOR_RESET}"; return 1; }
 
@@ -298,16 +246,16 @@ ensure_ech_server_keys() {
     fi
 
     CP_ECH_KEY_PATH="/etc/xray/ech/server-keys.txt"
-    step_ok "${LANG[ECH_KEYGEN_OK]}"
-    return 0
+    step_ok "${LANG[ECH_KEYGEN_OK]}"; return 0
 }
 
 # ---------------------------------------------------------------------------
-# Subscription template — ECH injection
+# ECH injection into XRAY_JSON templates.
 #
-# Reads each XRAY_JSON template's templateJson (an OBJECT), adds
-# echConfigList next to every tlsSettings.serverName that lacks one, and
-# PATCHes the object back with --argjson.
+# PATCH body is {uuid, templateJson} ONLY. Sending `name` collides with the
+# panel's reserved template names (A172); sending `templateType` is not in
+# the DTO. The uuid comes from the list endpoint, which returns the current
+# set every call — never cached across runs.
 # ---------------------------------------------------------------------------
 ensure_ech_subscription_templates() {
     local domain_url=$1 token=$2 ech_b64="$3"
@@ -331,9 +279,7 @@ ensure_ech_subscription_templates() {
         [ -z "$tpl" ] && { failed=$((failed+1)); continue; }
         name=$(echo "$tpl" | jq -r '.response.name // empty')
         body=$(echo "$tpl" | jq -c '.response.templateJson // empty')
-        if [ -z "$body" ] || [ "$body" = "null" ]; then
-            failed=$((failed+1)); continue
-        fi
+        if [ -z "$body" ] || [ "$body" = "null" ]; then failed=$((failed+1)); continue; fi
 
         if printf '%s' "$body" | jq -e '[.. | objects | select(has("echConfigList"))] | length > 0' >/dev/null 2>&1; then
             skipped=$((skipped+1)); continue
@@ -341,12 +287,9 @@ ensure_ech_subscription_templates() {
 
         patched=$(printf '%s' "$body" | jq -c --arg e "$ech_b64" \
             '(.. | objects | select(has("serverName") and (has("echConfigList") | not))) |= . + {echConfigList: $e}' 2>/dev/null)
-        if [ -z "$patched" ] || [ "$patched" = "$body" ]; then
-            skipped=$((skipped+1)); continue
-        fi
+        if [ -z "$patched" ] || [ "$patched" = "$body" ]; then skipped=$((skipped+1)); continue; fi
 
-        ub=$(jq -n --arg u "$uuid" --arg n "$name" --argjson b "$patched" \
-            '{uuid:$u,name:$n,templateType:"XRAY_JSON",templateJson:$b}')
+        ub=$(jq -n --arg u "$uuid" --argjson b "$patched" '{uuid:$u, templateJson:$b}')
         resp=$(make_api_request "PATCH" "http://$domain_url/api/subscription-templates" "$token" "$ub")
         if echo "$resp" | jq -e '.response.uuid' >/dev/null 2>&1; then
             step_ok "$(printf "${LANG[ECH_TEMPLATE_UPDATED]}" "$name")"; updated=$((updated+1))
@@ -359,17 +302,7 @@ ensure_ech_subscription_templates() {
 }
 
 # ---------------------------------------------------------------------------
-# Subscription template — fallback-host injection
-#
-# Adds at the root of every XRAY_JSON template:
-#
-#   "remnawave": {
-#     "addVirtualHostAsOutbound": true,
-#     "injectHosts": [
-#       { "selector": { "type": "sameTagAsRecipient" },
-#         "useHostRemarkAsTag": true }
-#     ]
-#   }
+# Fallback host injection. Same PATCH shape: {uuid, templateJson} only.
 # ---------------------------------------------------------------------------
 ensure_subscription_template_inject() {
     local domain_url=$1 token=$2
@@ -391,9 +324,7 @@ ensure_subscription_template_inject() {
         [ -z "$tpl" ] && { failed=$((failed+1)); continue; }
         name=$(echo "$tpl" | jq -r '.response.name // empty')
         body=$(echo "$tpl" | jq -c '.response.templateJson // empty')
-        if [ -z "$body" ] || [ "$body" = "null" ]; then
-            failed=$((failed+1)); continue
-        fi
+        if [ -z "$body" ] || [ "$body" = "null" ]; then failed=$((failed+1)); continue; fi
 
         if printf '%s' "$body" | jq -e '.remnawave.injectHosts' >/dev/null 2>&1; then
             skipped=$((skipped+1)); continue
@@ -408,31 +339,23 @@ ensure_subscription_template_inject() {
                 ]
             }' 2>/dev/null)
 
-        if [ -z "$patched" ] || [ "$patched" = "$body" ]; then
-            skipped=$((skipped+1)); continue
-        fi
+        if [ -z "$patched" ] || [ "$patched" = "$body" ]; then skipped=$((skipped+1)); continue; fi
 
-        ub=$(jq -n --arg u "$uuid" --arg n "$name" --argjson b "$patched" \
-            '{uuid:$u,name:$n,templateType:"XRAY_JSON",templateJson:$b}')
+        ub=$(jq -n --arg u "$uuid" --argjson b "$patched" '{uuid:$u, templateJson:$b}')
         resp=$(make_api_request "PATCH" "http://$domain_url/api/subscription-templates" "$token" "$ub")
         if echo "$resp" | jq -e '.response.uuid' >/dev/null 2>&1; then
             step_ok "Updated template: $name"; updated=$((updated+1))
         else
-            echo -e "${COLOR_YELLOW}Failed: $name${COLOR_RESET}"; failed=$((failed+1))
+            echo -e "${COLOR_YELLOW}Failed: $name — $resp${COLOR_RESET}"; failed=$((failed+1))
         fi
     done
     printf "${COLOR_GRAY}Templates: %d updated, %d skipped, %d failed${COLOR_RESET}\n" "$updated" "$skipped" "$failed"
     [ "$failed" -eq 0 ]
 }
 
-# ---------------------------------------------------------------------------
-# Node / host / squad operations
-# ---------------------------------------------------------------------------
-
 check_node_domain() {
     local domain_url="$1" token="$2" domain="$3"
-    local r
-    r=$(make_api_request "GET" "http://$domain_url/api/nodes" "$token")
+    local r; r=$(make_api_request "GET" "http://$domain_url/api/nodes" "$token")
     [ -z "$r" ] && { echo -e "${COLOR_RED}${LANG[ERROR_CHECK_DOMAIN]}${COLOR_RESET}"; return 1; }
     if echo "$r" | jq -e '.response' >/dev/null 2>&1; then
         local ex
@@ -458,8 +381,7 @@ $pf
 "trafficResetDay":31,"countryCode":"XX","consumptionMultiplier":1.0}
 EOF
 )
-    local r
-    r=$(make_api_request "POST" "http://$domain_url/api/nodes" "$token" "$nd")
+    local r; r=$(make_api_request "POST" "http://$domain_url/api/nodes" "$token" "$nd")
     if echo "$r" | jq -e '.response.uuid' >/dev/null 2>&1; then step_ok "${LANG[NODE_CREATED]}"; return 0; fi
     [ -z "$r" ] && echo -e "${COLOR_RED}${LANG[ERROR_EMPTY_RESPONSE_NODE]}${COLOR_RESET}" || echo -e "${COLOR_RED}${LANG[ERROR_CREATE_NODE]}: $r${COLOR_RESET}"
     return 1
@@ -467,8 +389,7 @@ EOF
 
 get_config_profiles() {
     local domain_url="$1" token="$2"
-    local r
-    r=$(make_api_request "GET" "http://$domain_url/api/config-profiles" "$token")
+    local r; r=$(make_api_request "GET" "http://$domain_url/api/config-profiles" "$token")
     if [ -z "$r" ] || ! echo "$r" | jq -e '.' >/dev/null 2>&1; then err_msg "${LANG[ERROR_NO_CONFIGS]}"; return 1; fi
     local u
     u=$(echo "$r" | jq -r '.response.configProfiles[] | select(.name=="Default-Profile") | .uuid' 2>/dev/null)
@@ -482,17 +403,12 @@ delete_config_profile() {
         uuid=$(get_config_profiles "$domain_url" "$token")
         if [ $? -ne 0 ] || [ -z "$uuid" ]; then return 0; fi
     fi
-    local r
-    r=$(make_api_request "DELETE" "http://$domain_url/api/config-profiles/$uuid" "$token")
+    local r; r=$(make_api_request "DELETE" "http://$domain_url/api/config-profiles/$uuid" "$token")
     [ -z "$r" ] && return 0
     echo "$r" | jq -e '.' >/dev/null 2>&1 || { echo -e "${COLOR_RED}${LANG[ERROR_DELETE_PROFILE]}${COLOR_RESET}"; return 1; }
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# Config profile creation
-# Emits:  line 1 = config profile UUID; then "<tag>:<inbound_uuid>" per inbound.
-# ---------------------------------------------------------------------------
 create_config_profile() {
     local domain_url=$1 token=$2
     local name="$CP_PROFILE_NAME" tag="$CP_INBOUND_TAG"
@@ -618,9 +534,6 @@ create_config_profile() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# Host creation with tag sanitizer
-# ---------------------------------------------------------------------------
 create_host() {
     local domain_url=$1 token=$2 iu=$3 addr=$4 cu=$5
     local remark="${6:-Steal}" host_tag="${7:-}" is_hidden="${8:-false}"
@@ -654,13 +567,11 @@ create_host() {
 get_default_squad() {
     local domain_url=$1 token=$2
     step_do "${LANG[GET_DEFAULT_SQUAD]}" >&2
-    local r
-    r=$(make_api_request "GET" "http://$domain_url/api/internal-squads" "$token")
+    local r; r=$(make_api_request "GET" "http://$domain_url/api/internal-squads" "$token")
     if [ -z "$r" ] || ! echo "$r" | jq -e '.response.internalSquads' >/dev/null 2>&1; then
         err_msg "${LANG[ERROR_GET_SQUAD]}: $r"; return 1
     fi
-    local sq
-    sq=$(echo "$r" | jq -r '.response.internalSquads[].uuid' 2>/dev/null)
+    local sq; sq=$(echo "$r" | jq -r '.response.internalSquads[].uuid' 2>/dev/null)
     [ -z "$sq" ] && { echo -e "${COLOR_YELLOW}${LANG[NO_SQUADS_FOUND]}${COLOR_RESET}" >&2; return 0; }
     local valid=""
     while IFS= read -r uuid; do
@@ -681,8 +592,7 @@ update_squad() {
     if [[ ! $iu =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
         echo -e "${COLOR_RED}${LANG[INVALID_INBOUND_UUID]}: $iu${COLOR_RESET}"; return 1
     fi
-    local sr
-    sr=$(make_api_request "GET" "http://$domain_url/api/internal-squads" "$token")
+    local sr; sr=$(make_api_request "GET" "http://$domain_url/api/internal-squads" "$token")
     if [ -z "$sr" ] || ! echo "$sr" | jq -e '.response.internalSquads' >/dev/null 2>&1; then
         echo -e "${COLOR_RED}${LANG[ERROR_GET_SQUAD]}: $sr${COLOR_RESET}"; return 1
     fi
@@ -715,8 +625,6 @@ create_api_token() {
         echo -e "${COLOR_RED}${LANG[ERROR_CREATE_API_TOKEN]}: $(echo "$r" | jq -r '.message // "Unknown error"')" >&2
         return 1
     fi
-    # The compose references REMNAWAVE_API_TOKEN=${api_token} — the
-    # substitution source is .env, so that is where the value must land.
     local ef="$target_dir/.env"
     if [ -f "$ef" ]; then
         if grep -q '^api_token=' "$ef"; then
